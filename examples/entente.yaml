@@ -1,0 +1,36 @@
+# Entente configuration. Unknown keys are rejected.
+# Changes are hot-reloaded, except node_id, xds.* and docker.host (restart).
+
+# Must equal node.id in the Envoy bootstrap.
+node_id: envoy
+
+xds:
+  socket: /run/entente/xds.sock
+  # Optional, defaults to "0600". Here the Envoy container runs as uid/gid
+  # 101 and Entente as root with gid 101, so the group needs access.
+  socket_mode: "0660"
+
+# The RDS route_config_names this control plane owns. Each must match a
+# listener's rds.route_config_name in the Envoy bootstrap. There is no default
+# entrypoint: a route that names none, or an undeclared one, is rejected.
+entrypoints:
+  - http
+  - https
+
+# Docker source. Remove the whole section to disable it.
+docker:
+  host: unix:///var/run/docker.sock
+  # Optional, defaults to "entente". Labels are read as <label_prefix>.<key>.
+  # label_prefix: entente
+
+# Static source, for backends that are not Docker containers.
+static:
+  backends:
+    - name: legacy
+      endpoints:            # IP:port literals only (served over EDS)
+        - 172.30.0.50:80
+  routes:
+    - name: legacy
+      entrypoints: [https]
+      host: legacy.example.com
+      backend: legacy

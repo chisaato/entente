@@ -1,0 +1,66 @@
+# Demo: Envoy + Entente + a labelled container + a static (non-Docker) backend.
+#
+#   ./test/e2e/run.sh        # generates certs, starts this stack, curls it
+#
+# or by hand:
+#   ./test/e2e/gencert.sh examples/certs
+#   docker compose -f examples/compose.yaml up --build
+#   curl -H 'Host: whoami.example.com' http://127.0.0.1:8080/
+#   curl -k --resolve legacy.example.com:8443:127.0.0.1 https://legacy.example.com:8443/
+
+name: entente-demo
+
+services:
+  envoy:
+    image: envoyproxy/envoy:v1.39-latest
+    command: ["envoy", "-c", "/etc/envoy/envoy.yaml"]
+    volumes:
+      - ./envoy.yaml:/etc/envoy/envoy.yaml:ro
+      - ./certs:/etc/envoy/certs:ro
+      - xds:/run/entente
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8443:8443"
+    networks: [edge]
+    depends_on: [entente]
+
+  entente:
+    build: ..
+    image: entente:dev
+    # Root for the Docker socket, group 101 so the Envoy user (uid/gid 101
+    # in the official image) can reach the 0660 xDS socket.
+    user: "0:101"
+    volumes:
+      - ./entente.yaml:/etc/entente/entente.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - xds:/run/entente
+    # xDS goes over the Unix socket; no network needed.
+    network_mode: none
+
+  whoami:
+    image: traefik/whoami
+    networks: [edge]
+    labels:
+      entente.enable: "true"
+      entente.entrypoints: "http,https"
+      entente.host: "whoami.example.com"
+      entente.port: "80"
+      entente.network: "entente-demo-edge"
+
+  # Stands in for a service outside Docker's view; routed via static config.
+  legacy:
+    image: traefik/whoami
+    command: ["--name", "legacy"]
+    networks:
+      edge:
+        ipv4_address: 172.30.0.50
+
+volumes:
+  xds:
+
+networks:
+  edge:
+    name: entente-demo-edge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

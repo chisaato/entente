@@ -1,0 +1,35 @@
+name: cleanup
+
+on:
+  schedule:
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+
+jobs:
+  workflow-runs:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      # 删除 30 天前的运行记录,每个 workflow 至少保留最近 10 次。
+      - uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 30
+          keep_minimum_runs: 10
+
+  untagged-images:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      # 多架构镜像的各平台 manifest 本身没有 tag;这个 action 会识别仍被
+      # 有 tag 的 index 引用的部分并跳过,不会弄坏 :dev / :latest。
+      - uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          package: ${{ github.event.repository.name }}
+          delete-untagged: true
+          older-than: 7 days

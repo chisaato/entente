@@ -3,7 +3,7 @@
 Envoy 的外挂控制平面。它读取 Docker 容器 label 和静态 YAML,通过 Unix socket 上的 xDS(CDS / EDS / RDS / SDS)
 把路由和证书推给 Envoy。证书来自 OpenBao KV,或本地 PEM 文件。效果类似 Traefik 的 Docker provider:给容器贴上 label,路由就自动出现;数据面是 Envoy。
 
-面向不跑 Kubernetes 的单机部署。设计见 [docs/design.md](docs/design.md)。
+面向不跑 Kubernetes 的单机部署。设计见 [docs/adr/](docs/adr/)，定位见 [ADR-0001](docs/adr/0001-standalone-envoy-control-plane.md)。
 
 ## 分工
 
@@ -78,7 +78,7 @@ WebSocket 升级由 Envoy bootstrap HCM 的 `upgrade_configs` 配置,Entente 不
 Entente 每次请求前重新读取 token 文件,不实现登录;生产环境可由 bao agent 用 AppRole 登录并维护 token sink。
 若 agent 通过替换文件更新 token,应挂载 sink 所在目录,避免单文件 bind mount 继续引用旧 inode。
 首次拉取失败时不下发该 secret,对应 TLS 入口保持 warming;后续失败保留上一份有效证书并重试。
-`secrets` 列表支持热重载,`openbao.*` 需要重启。完整语义见[设计文档 12.8 节](docs/design.md#128-sds从-openbao-kv-读证书)。
+`secrets` 列表支持热重载,`openbao.*` 需要重启。完整语义见 [ADR-0014](docs/adr/0014-sds-reads-kv-v2-with-a-token-file.md) 与 [ADR-0015](docs/adr/0015-per-secret-certificate-failure.md)。
 
 ### 本地 PEM 文件
 
@@ -98,14 +98,14 @@ secrets:
 Entente 启动时立即读取,并监听这两个文件的父目录,因此 acme.sh 原地覆盖或先写临时文件再 rename 都会被看到。
 证书和私钥必须成对通过校验后才下发;只更新了其中一个时保留上一份有效证书。目录或文件稍后出现会重试恢复,不依赖某一次文件系统事件。
 内容不变不推新快照;从配置删除该 secret 会立刻撤销。私钥不会写入日志,也不会为此发起 HTTP 请求。
-语义见[设计文档 12.12 节](docs/design.md#1212-sds从本地-pem-文件读证书-已定)。
+语义见 [ADR-0018](docs/adr/0018-local-pem-certificate-files.md)。
 
 ### SNI 兜底与自签证书
 
 示例 bootstrap 只对 `whoami.example.com` 和 `legacy.example.com` 的 SNI 出示 SDS 真证书。
 未知或缺失 SNI 走 `default_filter_chain`,用静态 secret `sink` 完成握手并返回 421。
 兜底不依赖 Entente 或 OpenBao;匹配域名但真证书缺失时仍握手失败,不退到兜底。
-详见[设计文档 12.10 节](docs/design.md#1210-sni-分流与兜底证书-建议)。
+详见 [ADR-0016](docs/adr/0016-sni-demultiplex-and-sink-chain-in-bootstrap.md)。
 
 ```sh
 entente gen-cert --name sink                     # 输出可贴进 static_resources.secrets 的 YAML 列表项
@@ -115,6 +115,8 @@ entente gen-cert --name sink --out-dir ./sink    # 写入 tls.crt(0644)、tls.ke
 该子命令不读取 `--config`,不连接服务。`--name` 始终必填;默认 CN / DNS SAN 为 `invalid`,
 ECDSA P-256 自签证书有效期默认 3650 天,可用 `--common-name` 和 `--days` 调整。
 示例的真证书来自 SDS,仅兜底证书挂载 `examples/sink/` 文件。
+
+只有 Envoy、控制平面还没连上时,`initial_fetch_timeout` 默认为 15s:CDS 先等 15s,RDS 和 SDS 再各等 15s,所以前约 30s 端口不监听。要缩短这段时间,在 bootstrap 里显式设置 `initial_fetch_timeout`。
 
 ## 容器 label
 
@@ -127,6 +129,14 @@ labels:
   entente.network: "edge"             # 容器挂在多张网络上时必填
   entente.timeout: "0s"               # 可选,覆盖 route_timeout;0s 表示不限时
 ```
+
+取值规则:
+
+- `enable` 只接受 `"true"` / `"false"`;缺失或 `"false"` 表示不暴露,其他值记错误
+- `host` 必须是小写主机名,最多一个前导 `*.` 通配
+- `port` 必填,不从 `EXPOSE` 推断
+- `network`:只挂一张网络时可省略;挂多张时必填。容器在该网络上没有 IP(如 `host` 网络)时拒绝
+- 只暴露状态为 `running` 的容器,`paused` 不暴露
 
 以下情况会拒绝该路由并打日志,不影响其他路由:
 

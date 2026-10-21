@@ -68,7 +68,7 @@ Status: ready-for-agent
 - bootstrap 需要加 `lds_config: { ads: {} }`。同一个 listener 不能既写在 `static_resources` 里又经 LDS 下发,因为静态 listener 不能被 LDS 修改。
 - 入口模型不变:listener 的 HCM 依旧用 RDS `route_config_name` 等于入口名;`entrypoints` 仍然要显式声明,listener 引用的入口必须已声明。
 - label 不能创建或修改 listener、TLS 绑定和证书引用。这些都属于运维在 YAML 里持有的安全配置。
-- 需要同步修订:`AGENTS.md` 的 "No LDS" 原则,`docs/design.md` 第 2、3、7 节和 12.10,并新增一个 12.x 小节记录本次决定和理由(对照 nginx / Traefik / Caddy 的分工、filter-chain-only update 行为、冷启动不再有 421 兜底的代价)。
+- 修订 AGENTS.md 的 No LDS 原则,并新增 ADR 取代 ADR-0004,同时更新 ADR-0016(SNI 分流不再全在 bootstrap)和 ADR-0012(Docker 来源 backend)。
 
 ### Listener 与 TLS 绑定的配置模型
 
@@ -133,7 +133,7 @@ Status: ready-for-agent
 
 ## Out of Scope
 
-- 只读的 status / metrics HTTP 端点(仍是第 9 节的后续阶段)。本次只做日志可观测。
+- 只读的 status / metrics HTTP 端点(见 `.scratch/backlog/issues/02-readonly-status-metrics.md`)。本次只做日志可观测。
 - NACK 后自动回滚到上一个已 ACK 的快照。
 - 增量 xDS(Delta)和 Envoy 的 on-demand 证书选择器。
 - 由 Entente 校验 bootstrap 文件、或调用 `envoy --mode validate`。

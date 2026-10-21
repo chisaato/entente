@@ -1,18 +1,17 @@
 # Entente — notes for agents
 
 Envoy control plane: Docker labels + static YAML → CDS/EDS/RDS over a Unix socket.
-Read `docs/design.md` before changing behaviour; section 12 records decisions made during
-implementation. Update that file when you make or change a design decision.
+改行为前读 `GLOSSARY.md` 和 `docs/adr/`；做出或改变设计决定时新增 ADR。
 
 ## Principles (from the design, non-negotiable)
 
 - Explicit configuration, no implicit defaults. No default entrypoint; a route that is unclear is
-  rejected, not guessed.
-- Fail closed, per route: a bad route is dropped and logged; other routes are unaffected.
-- No LDS. Listeners live in the Envoy bootstrap; entrypoint = RDS `route_config_name`.
+  rejected, not guessed. (ADR-0002)
+- Fail closed, per route: a bad route is dropped and logged; other routes are unaffected. (ADR-0011)
+- No LDS. Listeners live in the Envoy bootstrap; entrypoint = RDS `route_config_name`. (ADR-0004, ADR-0003)
 - Security decisions never come from labels. `PolicyRef` is reserved and must be rejected while the
-  policy layer does not exist.
-- All label parsing goes through `internal/labels.Parse`. Never hard-code the label prefix elsewhere.
+  policy layer does not exist. (ADR-0006)
+- All label parsing goes through `internal/labels.Parse`. Never hard-code the label prefix elsewhere. (ADR-0007)
 
 ## Commands
 
@@ -28,9 +27,12 @@ inside `docker build`, build the binary on the host and pass a compose override 
 
 ## Gotchas
 
-- go-control-plane's `SnapshotCache` must be created with `ads=false` (see design 12.2), and its
+- go-control-plane's `SnapshotCache` must be created with `ads=false` (ADR-0009), and its
   `Snapshot.Consistent()` does not fit static listeners; use `xds.Resources.consistent`.
-- Snapshot versions are content hashes; never use time.
+- Snapshot versions are content hashes; never use time. (ADR-0008)
+- `github.com/docker/docker` 停在 v28，不再更新；Docker 客户端用 `github.com/moby/moby/client`。
+- `go-control-plane` v0.14 要求 Go 1.25。
+- 资源命名：Route / Cluster 名为 `docker/<容器名>`、`static/<name>`；virtual host 名等于 route 名。每个生成的 cluster 显式设置 `connect_timeout: 5s` 和 `ROUND_ROBIN`，不依赖 Envoy 的内置默认值。
 
 ## Agent skills
 
@@ -45,4 +47,4 @@ each issue's `Status:` line. See `docs/agents/triage-labels.md`.
 
 ### Domain docs
 
-Single-context; decisions live in `docs/design.md` section 12. See `docs/agents/domain.md`.
+Single-context；`GLOSSARY.md` + `docs/adr/`。See `docs/agents/domain.md`.

@@ -31,3 +31,18 @@ inside `docker build`, build the binary on the host and pass a compose override 
 - go-control-plane's `SnapshotCache` must be created with `ads=false` (see design 12.2), and its
   `Snapshot.Consistent()` does not fit static listeners; use `xds.Resources.consistent`.
 - Snapshot versions are content hashes; never use time.
+
+## Agent skills
+
+### Issue tracker
+
+Local markdown: issues live under `.scratch/<feature>/`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five default roles (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`), recorded on
+each issue's `Status:` line. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context; decisions live in `docs/design.md` section 12. See `docs/agents/domain.md`.

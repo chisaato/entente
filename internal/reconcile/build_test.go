@@ -4,6 +4,7 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/chisaato/entente/internal/config"
 	"github.com/chisaato/entente/internal/docker"
@@ -13,6 +14,7 @@ func mustConfig(t *testing.T, extra string) *config.Config {
 	t.Helper()
 	c, err := config.Parse([]byte(`
 node_id: envoy
+route_timeout: 60s
 xds: {socket: /tmp/x.sock}
 entrypoints: [https, http]
 docker: {host: unix:///var/run/docker.sock}
@@ -62,7 +64,8 @@ func TestBuildDocker(t *testing.T) {
 	cfg := mustConfig(t, "")
 	m, rej := Build(cfg, []docker.Container{
 		exposed("whoami", "whoami.example.com", "https,http", oneNet),
-		ctr("plain", oneNet), // no labels: silently ignored
+		// 没有 label:静默忽略
+		ctr("plain", oneNet),
 	})
 	if len(rej) != 0 {
 		t.Fatalf("unexpected rejections: %v", rej)
@@ -142,7 +145,8 @@ static:
 `)
 	m, rej := Build(cfg, []docker.Container{
 		exposed("a", "dup.example.com", "https", oneNet),
-		exposed("b", "dup.example.com", "http", oneNet), // different entrypoint: no conflict
+		// 不同的 entrypoint:不冲突
+		exposed("b", "dup.example.com", "http", oneNet),
 	})
 	got := rejectedSubjects(rej)
 	if !strings.Contains(got["docker/a"], "static/legacy") || !strings.Contains(got["static/legacy"], "docker/a") {
@@ -181,5 +185,51 @@ static:
 	}
 	if len(m.Routes) != 1 || len(m.Backends[0].Endpoints) != 2 {
 		t.Errorf("model = %+v", m)
+	}
+}
+
+func TestBuildRouteTimeout(t *testing.T) {
+	for _, global := range []string{"60s", "0s"} {
+		t.Run(global, func(t *testing.T) {
+			cfg := mustConfig(t, `
+static:
+  backends: [{name: api, endpoints: ["10.0.0.5:8080"]}]
+  routes:
+    - {name: inherited, entrypoints: [https], host: inherited.example.com, backend: api}
+    - {name: unlimited, entrypoints: [https], host: unlimited.example.com, backend: api, timeout: "0s"}
+    - {name: custom, entrypoints: [https], host: custom.example.com, backend: api, timeout: "2m"}
+`)
+			// 从文件重新解析以验证热重载后的顶层值。
+			data := strings.Replace("node_id: envoy\nxds: {socket: /tmp/x.sock}\nentrypoints: [https]\nroute_timeout: 60s\n", "60s", global, 1)
+			reloaded, err := config.Parse([]byte(data))
+			if err != nil {
+				t.Fatal(err)
+			}
+			reloaded.Static, reloaded.Docker = cfg.Static, cfg.Docker
+			m, rej := Build(reloaded, []docker.Container{
+				exposed("inherited", "docker-inherited.example.com", "https", oneNet),
+				exposed("unlimited", "docker-unlimited.example.com", "https", oneNet, "entente.timeout", "0s"),
+				exposed("custom", "docker-custom.example.com", "https", oneNet, "entente.timeout", "2m"),
+				exposed("invalid", "invalid.example.com", "https", oneNet, "entente.timeout", "-1s"),
+			})
+			if len(rej) != 1 || rej[0].Subject != "container/invalid" || !strings.Contains(rej[0].Reason, "timeout") {
+				t.Fatalf("rejections = %v", rej)
+			}
+			if len(m.Routes) != 6 {
+				t.Fatalf("routes = %+v", m.Routes)
+			}
+			inherited, _ := time.ParseDuration(global)
+			for _, r := range m.Routes {
+				want := inherited
+				if strings.HasSuffix(r.Name, "/custom") {
+					want = 2 * time.Minute
+				} else if strings.HasSuffix(r.Name, "/unlimited") {
+					want = 0
+				}
+				if r.Timeout != want {
+					t.Errorf("%s timeout = %v, want %v", r.Name, r.Timeout, want)
+				}
+			}
+		})
 	}
 }

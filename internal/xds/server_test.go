@@ -9,8 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chisaato/entente/internal/secrets"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/resource/v3"
@@ -18,9 +20,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// TestServeOverUDS drives the server like Envoy would: an ADS stream asking
-// for the RouteConfiguration of one of the two entrypoints. It must be
-// answered even though Envoy did not name every RouteConfiguration.
+// TestServeOverUDS 像 Envoy 那样驱动 server:一条 ADS 流只请求两个 entrypoint 之一的
+// RouteConfiguration。即使 Envoy 没有点名每一份 RouteConfiguration,也必须得到应答。
 func TestServeOverUDS(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -28,7 +29,7 @@ func TestServeOverUDS(t *testing.T) {
 	sock := filepath.Join(t.TempDir(), "xds.sock")
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	snapshots := cache.NewSnapshotCache(false, cache.IDHash{}, nil)
-	res := Translate(testModel(), nil)
+	res := Translate(testModel(), nil, []secrets.Certificate{{Name: "example-cert", Certificate: []byte("chain"), PrivateKey: []byte("key")}})
 	v, _ := res.Version()
 	snap, err := res.Snapshot(v)
 	if err != nil {
@@ -89,6 +90,25 @@ func TestServeOverUDS(t *testing.T) {
 
 	if got := routeNames.Names(); len(got) != 1 || got[0] != "https" {
 		t.Errorf("observed route names = %v", got)
+	}
+
+	// SDS 和 RDS 共用同一条 ADS 流。
+	if err := stream.Send(&discovery.DiscoveryRequest{Node: &core.Node{Id: "envoy"}, TypeUrl: resource.SecretType, ResourceNames: []string{"example-cert"}}); err != nil {
+		t.Fatal(err)
+	}
+	sds, err := stream.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sds.GetTypeUrl() != resource.SecretType || sds.GetVersionInfo() != v || len(sds.GetResources()) != 1 {
+		t.Fatal("invalid SDS response")
+	}
+	var secret tlsv3.Secret
+	if err := sds.GetResources()[0].UnmarshalTo(&secret); err != nil {
+		t.Fatal(err)
+	}
+	if secret.GetName() != "example-cert" || string(secret.GetTlsCertificate().GetCertificateChain().GetInlineBytes()) != "chain" || string(secret.GetTlsCertificate().GetPrivateKey().GetInlineBytes()) != "key" {
+		t.Fatal("invalid SDS certificate")
 	}
 
 	srv.Stop()

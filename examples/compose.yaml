@@ -1,10 +1,19 @@
-# Demo: Envoy + Entente + a labelled container + a static (non-Docker) backend.
+# 演示:Envoy + Entente + OpenBao + 一个带 label 的容器 + 一个静态后端。
 #
-#   ./test/e2e/run.sh        # generates certs, starts this stack, curls it
+#   ./test/e2e/run.sh        # 生成证书,启动这套栈,并用 curl 检查
 #
-# or by hand:
+# 或者手动:
 #   ./test/e2e/gencert.sh examples/certs
-#   docker compose -f examples/compose.yaml up --build
+#   docker compose -f examples/compose.yaml build entente
+#   mkdir -p examples/sink
+#   docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/examples/sink:/out" entente:dev gen-cert --name sink --out-dir /out
+#   chmod 0644 examples/sink/tls.key # 仅用于演示,使 Envoy 的 uid 101 可读
+#   (umask 077; printf '%s\n' entente-demo-token > examples/bao-token)
+#   docker compose -f examples/compose.yaml up -d openbao
+#   # 等到以下命令成功后,先写入 KV,再启动 Entente。
+#   docker compose -f examples/compose.yaml exec -T openbao bao status -address=http://127.0.0.1:8200
+#   docker compose -f examples/compose.yaml exec -T -e BAO_TOKEN=entente-demo-token openbao bao kv put -address=http://127.0.0.1:8200 secret/entente/demo fullchain=@/certs/tls.crt key=@/certs/tls.key
+#   docker compose -f examples/compose.yaml up -d --build
 #   curl -H 'Host: whoami.example.com' http://127.0.0.1:8080/
 #   curl -k --resolve legacy.example.com:8443:127.0.0.1 https://legacy.example.com:8443/
 
@@ -16,7 +25,7 @@ services:
     command: ["envoy", "-c", "/etc/envoy/envoy.yaml"]
     volumes:
       - ./envoy.yaml:/etc/envoy/envoy.yaml:ro
-      - ./certs:/etc/envoy/certs:ro
+      - ./sink:/etc/envoy/sink:ro
       - xds:/run/entente
     ports:
       - "127.0.0.1:8080:8080"
@@ -27,15 +36,28 @@ services:
   entente:
     build: ..
     image: entente:dev
-    # Root for the Docker socket, group 101 so the Envoy user (uid/gid 101
-    # in the official image) can reach the 0660 xDS socket.
+    # 以 root 访问 Docker socket,组为 101,使官方镜像里的 Envoy 用户
+    # (uid/gid 101)能够访问权限为 0660 的 xDS socket。
     user: "0:101"
     volumes:
       - ./entente.yaml:/etc/entente/entente.yaml:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./bao-token:/run/bao/token:ro
       - xds:/run/entente
-    # xDS goes over the Unix socket; no network needed.
-    network_mode: none
+    # xDS 走 Unix socket;网络只用于读 OpenBao,不接入后端网络。
+    networks: [bao]
+    depends_on: [openbao]
+
+  # 仅用于演示:dev 模式不持久化,默认在 secret/ 挂载 KV v2。
+  # 固定 root token 不能用于生产;生产环境请用 bao agent 维护最小权限 token。
+  openbao:
+    image: openbao/openbao:2
+    command: ["server", "-dev", "-dev-root-token-id=entente-demo-token", "-dev-listen-address=0.0.0.0:8200"]
+    # dev 模式关闭 mlock,不需要额外的 IPC_LOCK capability。
+    volumes:
+      # 仅用于 CLI 初始化 KV,Envoy 和 Entente 不挂载证书文件。
+      - ./certs:/certs:ro
+    networks: [bao]
 
   whoami:
     image: traefik/whoami
@@ -47,7 +69,7 @@ services:
       entente.port: "80"
       entente.network: "entente-demo-edge"
 
-  # Stands in for a service outside Docker's view; routed via static config.
+  # 代表 Docker 视野之外的服务;通过静态配置路由。
   legacy:
     image: traefik/whoami
     command: ["--name", "legacy"]
@@ -59,6 +81,8 @@ volumes:
   xds:
 
 networks:
+  bao:
+    internal: true
   edge:
     name: entente-demo-edge
     ipam:

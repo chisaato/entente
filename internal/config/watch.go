@@ -9,12 +9,11 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-// Watch reloads the config file whenever it changes and passes every config
-// that loads and validates to onChange. Invalid configs are logged and
-// skipped; the previous config stays in effect.
+// Watch 在配置文件变化时重新加载,并把每一份能成功加载且通过校验的配置交给 onChange。
+// 无效配置只记日志并跳过,继续沿用上一份配置。
 //
-// The parent directory is watched rather than the file, so editors that
-// replace the file via rename and Kubernetes-style symlink swaps are seen.
+// 监听的是父目录而不是文件本身,因此编辑器通过 rename 替换文件、
+// 以及 Kubernetes 风格的符号链接切换都能被看到。
 func Watch(ctx context.Context, path string, log *slog.Logger, onChange func(*Config)) error {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {

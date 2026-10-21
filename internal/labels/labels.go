@@ -1,8 +1,7 @@
-// Package labels parses Entente's container labels.
+// Package labels 解析 Entente 的容器 label。
 //
-// Parse is the only place that knows how label keys are built from the
-// configured prefix. Nothing else in the code base may hard-code a prefix or
-// a full label key.
+// Parse 是唯一知道如何用配置的前缀拼出 label key 的地方。
+// 代码库的其他地方不得硬编码前缀或完整的 label key。
 package labels
 
 import (
@@ -11,9 +10,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
-// Label keys, relative to the configured prefix.
+// 相对于配置前缀的 label key。
 const (
 	keyEnable      = "enable"
 	keyEntrypoints = "entrypoints"
@@ -21,6 +21,7 @@ const (
 	keyPort        = "port"
 	keyNetwork     = "network"
 	keyPolicy      = "policy"
+	keyTimeout     = "timeout"
 )
 
 var knownKeys = map[string]bool{
@@ -30,29 +31,30 @@ var knownKeys = map[string]bool{
 	keyPort:        true,
 	keyNetwork:     true,
 	keyPolicy:      true,
+	keyTimeout:     true,
 }
 
-// Spec is the parsed routing intent of one container.
+// Spec 是单个容器解析后的路由意图。
 type Spec struct {
 	Entrypoints []string
 	Host        string
 	Port        uint16
-	// Network is the Docker network to take the container IP from. Empty
-	// means "not specified"; the caller decides whether that is acceptable.
+	// Timeout 为可选覆盖值;nil 表示继承顶层 route_timeout。
+	Timeout *time.Duration
+	// Network 是用于取容器 IP 的 Docker 网络。空表示"未指定";
+	// 是否可接受由调用方决定。
 	Network string
-	// Policy is reserved. It is passed through so the reconciler can reject
-	// it on the same path as static routes.
+	// Policy 为预留字段。原样传出,以便 reconciler 用与静态路由相同的路径拒绝它。
 	Policy string
 }
 
-// hostRe accepts lower-case DNS names and a single leading "*." wildcard.
+// hostRe 接受小写 DNS 名,以及一个前导 "*." 通配。
 var hostRe = regexp.MustCompile(`^(\*\.)?([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 
-// Parse extracts the Spec for prefix from a container's labels.
+// Parse 从容器 label 中提取 prefix 对应的 Spec。
 //
-// It returns enabled=false with a nil error when the container carries no
-// "<prefix>.enable=true" label; such containers are ignored. Any malformed,
-// missing or unknown "<prefix>.*" label on an enabled container is an error.
+// 容器没有 "<prefix>.enable=true" 时返回 enabled=false 且 err 为 nil;这类容器被忽略。
+// 已启用的容器上,任何格式错误、缺失或未知的 "<prefix>.*" label 都是错误。
 func Parse(prefix string, labels map[string]string) (spec Spec, enabled bool, err error) {
 	own := map[string]string{}
 	p := prefix + "."
@@ -119,6 +121,13 @@ func Parse(prefix string, labels map[string]string) (spec Spec, enabled bool, er
 
 	spec.Network = own[keyNetwork]
 	spec.Policy = own[keyPolicy]
+	if v, ok := own[keyTimeout]; ok {
+		if d, perr := time.ParseDuration(v); perr != nil || d < 0 {
+			fail("label %s%s=%q: want a non-negative Go duration", p, keyTimeout, v)
+		} else {
+			spec.Timeout = &d
+		}
+	}
 
 	if len(errs) > 0 {
 		return Spec{}, true, fmt.Errorf("%s", strings.Join(errs, "; "))
@@ -126,6 +135,5 @@ func Parse(prefix string, labels map[string]string) (spec Spec, enabled bool, er
 	return spec, true, nil
 }
 
-// ValidHost reports whether h is acceptable as a route host. Static routes use
-// it so both sources share one definition.
+// ValidHost 报告 h 能否作为路由 host。静态路由也用它,使两个来源共用同一定义。
 func ValidHost(h string) bool { return hostRe.MatchString(h) }

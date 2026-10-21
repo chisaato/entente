@@ -1,9 +1,8 @@
-// Package config loads and validates Entente's YAML configuration.
+// Package config 加载并校验 Entente 的 YAML 配置。
 //
-// Validation here is file-level only: required fields, name syntax,
-// uniqueness, endpoint syntax. Whether a static Route references a declared
-// entrypoint or an existing backend is checked per Route by the reconciler,
-// so one bad Route never takes the others down with it.
+// 这里只做文件级校验:必填字段、名字语法、唯一性、endpoint 语法。
+// 静态 Route 是否引用了已声明的 entrypoint 或已存在的 backend,由 reconciler
+// 按每条 Route 检查,因此一条坏路由不会把其他路由一起拖垮。
 package config
 
 import (
@@ -15,46 +14,68 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
+	"time"
 
 	"go.yaml.in/yaml/v3"
 )
 
-// DefaultLabelPrefix is used when docker.label_prefix is not set.
+// DefaultLabelPrefix 在未设置 docker.label_prefix 时使用。
 const DefaultLabelPrefix = "entente"
 
-// DefaultSocketMode is used when xds.socket_mode is not set. It is the most
-// restrictive mode that still lets a same-owner Envoy connect.
+// DefaultSocketMode 在未设置 xds.socket_mode 时使用。它是仍允许同一属主的
+// Envoy 连上来的最严权限。
 const DefaultSocketMode os.FileMode = 0o600
 
 type Config struct {
-	// NodeID must equal node.id in the Envoy bootstrap. Snapshots are only
-	// published for this node.
+	// NodeID 必须等于 Envoy bootstrap 里的 node.id。快照只发布给这个 node。
 	NodeID string `yaml:"node_id"`
 
 	XDS XDS `yaml:"xds"`
 
-	// Entrypoints lists the RDS route_config_names this control plane owns.
-	// There is no default entrypoint.
+	// Entrypoints 列出本控制平面负责的 RDS route_config_name。
+	// 没有默认 entrypoint。
 	Entrypoints []string `yaml:"entrypoints"`
 
-	// Docker enables the Docker source. Absent means disabled.
+	// RouteTimeout 是必填的路由超时,0s 表示不限时。
+	RouteTimeout string `yaml:"route_timeout"`
+	routeTimeout time.Duration
+
+	// Docker 启用 Docker 来源。缺省表示关闭。
 	Docker *Docker `yaml:"docker"`
 
-	Static Static `yaml:"static"`
+	Static  Static   `yaml:"static"`
+	OpenBao *OpenBao `yaml:"openbao"`
+	Secrets []Secret `yaml:"secrets"`
+}
+
+type OpenBao struct {
+	Address         string `yaml:"address"`
+	TokenFile       string `yaml:"token_file"`
+	CAFile          string `yaml:"ca_file"`
+	RefreshInterval string `yaml:"refresh_interval"`
+}
+
+type Secret struct {
+	Name             string `yaml:"name"`
+	KVMount          string `yaml:"kv_mount"`
+	KVPath           string `yaml:"kv_path"`
+	CertificateField string `yaml:"certificate_field"`
+	PrivateKeyField  string `yaml:"private_key_field"`
 }
 
 type XDS struct {
-	// Socket is the Unix domain socket path the xDS gRPC server listens on.
+	// Socket 是 xDS gRPC 服务器监听的 Unix domain socket 路径。
 	Socket string `yaml:"socket"`
-	// SocketMode is an octal permission string such as "0600" or "0660".
+	// SocketMode 是八进制权限字符串,例如 "0600" 或 "0660"。
 	SocketMode string `yaml:"socket_mode"`
 }
 
 type Docker struct {
-	// Host is the Docker Engine API address, e.g. unix:///var/run/docker.sock.
+	// Host 是 Docker Engine API 地址,例如 unix:///var/run/docker.sock。
 	Host string `yaml:"host"`
-	// LabelPrefix namespaces the container labels this instance reads.
-	// Defaults to DefaultLabelPrefix.
+	// LabelPrefix 限定本实例读取的容器 label 命名空间。
+	// 默认值为 DefaultLabelPrefix。
 	LabelPrefix string `yaml:"label_prefix"`
 }
 
@@ -65,14 +86,14 @@ type Static struct {
 
 type StaticBackend struct {
 	Name string `yaml:"name"`
-	// Endpoints are "IP:port" literals. Hostnames are not accepted because
-	// backends are served over EDS, which carries addresses, not names.
+	// Endpoints 是 "IP:port" 字面量。不接受主机名,因为 backend 经 EDS 下发,
+	// EDS 携带的是地址而不是名字。
 	Endpoints []string `yaml:"endpoints"`
 
 	parsed []netip.AddrPort
 }
 
-// ParsedEndpoints returns the endpoints validated by Load.
+// ParsedEndpoints 返回 Load 校验过的 endpoints。
 func (b StaticBackend) ParsedEndpoints() []netip.AddrPort { return b.parsed }
 
 type StaticRoute struct {
@@ -80,20 +101,30 @@ type StaticRoute struct {
 	Entrypoints []string `yaml:"entrypoints"`
 	Host        string   `yaml:"host"`
 	Backend     string   `yaml:"backend"`
-	// Policy is reserved; any non-empty value makes the route rejected.
+	// Timeout 可选,覆盖顶层 route_timeout;指针用于区分省略与显式空值。
+	Timeout *string `yaml:"timeout"`
+	timeout *time.Duration
+	// Policy 为预留字段;任何非空值都会使该路由被拒绝。
 	Policy string `yaml:"policy"`
 }
 
-// SocketFileMode returns the parsed xds.socket_mode.
+// ParsedRouteTimeout 返回文件级校验过的路由超时。
+func (c *Config) ParsedRouteTimeout() time.Duration { return c.routeTimeout }
+
+// ParsedTimeout 返回文件级校验过的覆盖值;nil 表示继承顶层配置。
+func (r StaticRoute) ParsedTimeout() *time.Duration { return r.timeout }
+
+// SocketFileMode 返回解析后的 xds.socket_mode。
 func (c *Config) SocketFileMode() os.FileMode {
 	if c.XDS.SocketMode == "" {
 		return DefaultSocketMode
 	}
-	m, _ := strconv.ParseUint(c.XDS.SocketMode, 8, 32) // validated in Load
+	// 已在 Load 中校验过。
+	m, _ := strconv.ParseUint(c.XDS.SocketMode, 8, 32)
 	return os.FileMode(m)
 }
 
-// Load reads, strictly decodes and validates the config file at path.
+// Load 读取 path 处的配置文件,严格解码并校验。
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -102,7 +133,7 @@ func Load(path string) (*Config, error) {
 	return Parse(data)
 }
 
-// Parse strictly decodes and validates YAML config. Unknown keys are errors.
+// Parse 严格解码并校验 YAML 配置。未知字段视为错误。
 func Parse(data []byte) (*Config, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
@@ -123,9 +154,9 @@ func Parse(data []byte) (*Config, error) {
 }
 
 var (
-	// nameRe covers entrypoint, backend and route names.
+	// nameRe 覆盖 entrypoint、backend 和 route 的名字。
 	nameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$`)
-	// LabelPrefixRe is the accepted syntax for docker.label_prefix.
+	// LabelPrefixRe 是 docker.label_prefix 接受的语法。
 	LabelPrefixRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$`)
 )
 
@@ -135,6 +166,11 @@ func (c *Config) validate() error {
 
 	if c.NodeID == "" {
 		add("node_id is required and must match node.id in the Envoy bootstrap")
+	}
+	if d, err := time.ParseDuration(c.RouteTimeout); err != nil || d < 0 {
+		add("route_timeout is required and must be a non-negative Go duration")
+	} else {
+		c.routeTimeout = d
 	}
 	if c.XDS.Socket == "" {
 		add("xds.socket is required")
@@ -170,6 +206,38 @@ func (c *Config) validate() error {
 	}
 
 	seen = map[string]bool{}
+	if len(c.Secrets) > 0 && c.OpenBao == nil {
+		add("openbao is required when secrets are configured")
+	}
+	if c.OpenBao != nil {
+		if len(c.Secrets) == 0 {
+			add("openbao requires at least one secret")
+		}
+		if strings.TrimSpace(c.OpenBao.Address) == "" {
+			add("openbao.address is required")
+		}
+		if strings.TrimSpace(c.OpenBao.TokenFile) == "" {
+			add("openbao.token_file is required")
+		}
+		if d, err := time.ParseDuration(c.OpenBao.RefreshInterval); err != nil || d <= 0 {
+			add("openbao.refresh_interval must be a positive Go duration")
+		}
+	}
+	for i, s := range c.Secrets {
+		if !nameRe.MatchString(s.Name) {
+			add("secrets[%d]: invalid name %q", i, s.Name)
+		}
+		if seen[s.Name] {
+			add("secret %q declared twice", s.Name)
+		}
+		seen[s.Name] = true
+		for field, value := range map[string]string{"kv_mount": s.KVMount, "kv_path": s.KVPath, "certificate_field": s.CertificateField, "private_key_field": s.PrivateKeyField} {
+			if strings.TrimSpace(value) == "" {
+				add("secrets[%d].%s is required", i, field)
+			}
+		}
+	}
+	seen = map[string]bool{}
 	for i := range c.Static.Backends {
 		b := &c.Static.Backends[i]
 		if !nameRe.MatchString(b.Name) {
@@ -194,7 +262,15 @@ func (c *Config) validate() error {
 	}
 
 	seen = map[string]bool{}
-	for i, r := range c.Static.Routes {
+	for i := range c.Static.Routes {
+		r := &c.Static.Routes[i]
+		if r.Timeout != nil {
+			if d, err := time.ParseDuration(*r.Timeout); err != nil || d < 0 {
+				add("static.routes[%d].timeout must be a non-negative Go duration", i)
+			} else {
+				r.timeout = &d
+			}
+		}
 		if !nameRe.MatchString(r.Name) {
 			add("static.routes[%d]: invalid name %q (want %s)", i, r.Name, nameRe)
 		}
@@ -207,10 +283,12 @@ func (c *Config) validate() error {
 	return errors.Join(errs...)
 }
 
-// RestartRequired reports the fields that differ between old and new but
-// cannot be applied without restarting the process.
+// RestartRequired 报告 old 与 new 之间有差异、但不重启进程就无法生效的字段。
 func RestartRequired(old, new *Config) []string {
 	var diff []string
+	if (old.OpenBao == nil) != (new.OpenBao == nil) || (old.OpenBao != nil && new.OpenBao != nil && *old.OpenBao != *new.OpenBao) {
+		diff = append(diff, "openbao")
+	}
 	if old.NodeID != new.NodeID {
 		diff = append(diff, "node_id")
 	}

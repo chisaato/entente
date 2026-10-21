@@ -1,16 +1,17 @@
-# Minimal Envoy bootstrap for Entente.
+# Entente 用的最小 Envoy bootstrap。
 #
-# Division of labour:
-#   - Listeners (ports, TLS, filter chains) are static and live here. Entente
-#     never creates or changes listeners; LDS is not used.
-#   - Each listener's HttpConnectionManager fetches its routes over RDS by
-#     route_config_name. That name is the "entrypoint" Entente's config
-#     declares and container labels reference.
-#   - Clusters and endpoints come from Entente over CDS/EDS.
-#   - Everything dynamic travels on one ADS stream to Entente's Unix socket.
+# 分工:
+#   - Listener(端口、TLS、filter chain)是静态的,写在这里。Entente
+#     从不创建或修改 listener;不使用 LDS。
+#   - 业务 filter chain 的 HttpConnectionManager 通过 RDS,按
+#     route_config_name 拉取路由。这个名字就是 Entente 配置里声明、
+#     容器 label 所引用的 "entrypoint"。
+#   - cluster 和 endpoint 由 Entente 经 CDS/EDS 下发。
+#   - 真证书由 Entente 从 OpenBao 读取,经 SDS 下发;兜底证书和路由完全静态。
+#   - 所有动态资源走同一条 ADS 流,连到 Entente 的 Unix socket。
 
 node:
-  # Must equal node_id in the Entente config.
+  # 必须与 Entente 配置里的 node_id 相同。
   id: envoy
   cluster: entente-demo
 
@@ -28,9 +29,16 @@ dynamic_resources:
   cds_config:
     resource_api_version: V3
     ads: {}
-  # No lds_config: listeners are static.
+  # 没有 lds_config:listener 是静态的。
 
 static_resources:
+  # 兜底证书是静态 secret,不依赖 Entente 或 OpenBao。
+  # 生产可用 entente gen-cert --name sink 输出的内联 YAML 替换此项。
+  secrets:
+    - name: sink
+      tls_certificate:
+        certificate_chain: { filename: /etc/envoy/sink/tls.crt }
+        private_key: { filename: /etc/envoy/sink/tls.key }
   clusters:
     - name: entente_xds
       type: STATIC
@@ -39,7 +47,8 @@ static_resources:
         envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
           "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
           explicit_http_config:
-            http2_protocol_options: {}   # gRPC needs HTTP/2
+            # gRPC 需要 HTTP/2。
+            http2_protocol_options: {}
       load_assignment:
         cluster_name: entente_xds
         endpoints:
@@ -58,10 +67,12 @@ static_resources:
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: http
-                # Match "Host: app.example.com:8080" against domain "app.example.com".
+                upgrade_configs: [{upgrade_type: websocket}]
+                # 把 "Host: app.example.com:8080" 按域名 "app.example.com" 匹配。
                 strip_any_host_port: true
                 rds:
-                  route_config_name: http        # entrypoint name
+                  # entrypoint 名。
+                  route_config_name: http
                   config_source:
                     resource_api_version: V3
                     ads: {}
@@ -73,24 +84,35 @@ static_resources:
     - name: https
       address:
         socket_address: { address: 0.0.0.0, port_value: 8443 }
+      listener_filters:
+        - name: envoy.filters.listener.tls_inspector
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
       filter_chains:
-        - transport_socket:
+        - filter_chain_match:
+            # 精确匹配示例域名,不让未知 SNI 取得真实证书。
+            server_names: [whoami.example.com, legacy.example.com]
+          transport_socket:
             name: envoy.transport_sockets.tls
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
               common_tls_context:
-                # File-based certificates. SDS is a later phase.
-                tls_certificates:
-                  - certificate_chain: { filename: /etc/envoy/certs/tls.crt }
-                    private_key: { filename: /etc/envoy/certs/tls.key }
+                # 真证书按名字订阅,与路由共用 ADS,不挂载真证书文件。
+                tls_certificate_sds_secret_configs:
+                  - name: demo-cert
+                    sds_config:
+                      resource_api_version: V3
+                      ads: {}
           filters:
             - name: envoy.filters.network.http_connection_manager
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: https
+                upgrade_configs: [{upgrade_type: websocket}]
                 strip_any_host_port: true
                 rds:
-                  route_config_name: https       # entrypoint name
+                  # entrypoint 名。
+                  route_config_name: https
                   config_source:
                     resource_api_version: V3
                     ads: {}
@@ -98,3 +120,31 @@ static_resources:
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+      # 不匹配或没有 SNI 时,使用独立于动态配置的证书和路由。
+      default_filter_chain:
+        transport_socket:
+          name: envoy.transport_sockets.tls
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+            common_tls_context:
+              tls_certificate_sds_secret_configs:
+                - name: sink
+        filters:
+          - name: envoy.filters.network.http_connection_manager
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+              stat_prefix: sink
+              route_config:
+                name: sink
+                virtual_hosts:
+                  - name: sink
+                    domains: ["*"]
+                    routes:
+                      - match: { prefix: "/" }
+                        direct_response:
+                          status: 421
+                          body: { inline_string: "Misdirected Request\n" }
+              http_filters:
+                - name: envoy.filters.http.router
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router

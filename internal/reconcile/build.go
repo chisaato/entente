@@ -1,4 +1,4 @@
-// Package reconcile merges all sources into a validated model.Model.
+// Package reconcile 把所有来源合并成经过校验的 model.Model。
 package reconcile
 
 import (
@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/chisaato/entente/internal/config"
 	"github.com/chisaato/entente/internal/docker"
@@ -14,22 +15,20 @@ import (
 	"github.com/chisaato/entente/internal/model"
 )
 
-// Rejection records why a route (or container) was left out of the model.
+// Rejection 记录一条路由(或一个容器)被排除出模型的原因。
 type Rejection struct {
-	// Subject is the route name, or "container/<name>" when no route could be
-	// built from a container at all.
+	// Subject 是路由名;如果根本无法从容器构建出路由,则为 "container/<name>"。
 	Subject string
 	Reason  string
 }
 
 func (r Rejection) String() string { return r.Subject + ": " + r.Reason }
 
-// Build turns the config and the current Docker containers into a Model.
+// Build 把配置和当前的 Docker 容器变成 Model。
 //
-// Every check fails closed and is scoped to the offending route: a rejected
-// route is left out and reported, all other routes are unaffected. When two
-// or more routes claim the same host on the same entrypoint, all of them are
-// rejected, because picking a winner would be an implicit rule.
+// 每项检查都 fail closed,并且只作用于出错的那条路由:被拒绝的路由被排除并上报,
+// 其他路由不受影响。两条及以上路由在同一 entrypoint 上声明同一 host 时,全部拒绝,
+// 因为挑出一个赢家本身就是隐含规则。
 func Build(cfg *config.Config, containers []docker.Container) (*model.Model, []Rejection) {
 	var (
 		routes   []model.Route
@@ -40,7 +39,7 @@ func Build(cfg *config.Config, containers []docker.Container) (*model.Model, []R
 		rejected = append(rejected, Rejection{Subject: subject, Reason: fmt.Sprintf(format, a...)})
 	}
 
-	// Static source.
+	// 静态来源。
 	for _, b := range cfg.Static.Backends {
 		name := "static/" + b.Name
 		backends[name] = model.Backend{Name: name, Source: model.SourceStatic, Endpoints: b.ParsedEndpoints()}
@@ -53,10 +52,11 @@ func Build(cfg *config.Config, containers []docker.Container) (*model.Model, []R
 			Host:        r.Host,
 			Backend:     "static/" + r.Backend,
 			PolicyRef:   r.Policy,
+			Timeout:     routeTimeout(cfg, r.ParsedTimeout()),
 		})
 	}
 
-	// Docker source.
+	// Docker 来源。
 	if cfg.Docker != nil {
 		for _, c := range containers {
 			spec, enabled, err := labels.Parse(cfg.Docker.LabelPrefix, c.Labels)
@@ -86,11 +86,12 @@ func Build(cfg *config.Config, containers []docker.Container) (*model.Model, []R
 				Host:        spec.Host,
 				Backend:     name,
 				PolicyRef:   spec.Policy,
+				Timeout:     routeTimeout(cfg, spec.Timeout),
 			})
 		}
 	}
 
-	// Per-route checks.
+	// 逐条路由检查。
 	declared := map[string]bool{}
 	for _, ep := range cfg.Entrypoints {
 		declared[ep] = true
@@ -104,8 +105,8 @@ func Build(cfg *config.Config, containers []docker.Container) (*model.Model, []R
 		valid = append(valid, r)
 	}
 
-	// Host conflicts per entrypoint.
-	claims := map[[2]string][]string{} // {entrypoint, host} -> route names
+	// 每个 entrypoint 上的 host 冲突:{entrypoint, host} -> 路由名。
+	claims := map[[2]string][]string{}
 	for _, r := range valid {
 		for _, ep := range r.Entrypoints {
 			k := [2]string{ep, r.Host}
@@ -145,6 +146,14 @@ func Build(cfg *config.Config, containers []docker.Container) (*model.Model, []R
 	return m, rejected
 }
 
+// routeTimeout 只在未提供覆盖值时继承顶层配置,显式 0 不会被当成缺省。
+func routeTimeout(cfg *config.Config, override *time.Duration) time.Duration {
+	if override != nil {
+		return *override
+	}
+	return cfg.ParsedRouteTimeout()
+}
+
 func checkRoute(r model.Route, declared map[string]bool, backends map[string]model.Backend) string {
 	if r.PolicyRef != "" {
 		return fmt.Sprintf("policy %q requested, but the policy layer is not implemented yet", r.PolicyRef)
@@ -166,8 +175,8 @@ func checkRoute(r model.Route, declared map[string]bool, backends map[string]mod
 	return ""
 }
 
-// pickAddress returns the container's address on network. An empty network
-// is only accepted when the container is attached to exactly one network.
+// pickAddress 返回容器在 network 上的地址。network 为空时,
+// 仅当容器只挂在恰好一张网络上才接受。
 func pickAddress(c docker.Container, network string) (netip.Addr, error) {
 	if network == "" {
 		if len(c.Networks) != 1 {

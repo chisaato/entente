@@ -1,36 +1,63 @@
-# Entente configuration. Unknown keys are rejected.
-# Changes are hot-reloaded, except node_id, xds.* and docker.host (restart).
+# Entente 配置。未知字段会被拒绝。
+# node_id、xds.*、Docker 来源开关、docker.host 和 openbao.* 改动需要重启。
+# entrypoints、route_timeout、static、docker.label_prefix 和 secrets 支持热重载。
 
-# Must equal node.id in the Envoy bootstrap.
+# 必须与 Envoy bootstrap 里的 node.id 相同。
 node_id: envoy
+
+# 必填,非负 Go duration。0s 表示不限时,不沿用 Envoy 隐式的 15s。
+# 静态路由 timeout 或容器的 <label_prefix>.timeout 可覆盖此值。
+route_timeout: 60s
 
 xds:
   socket: /run/entente/xds.sock
-  # Optional, defaults to "0600". Here the Envoy container runs as uid/gid
-  # 101 and Entente as root with gid 101, so the group needs access.
+  # 可选,默认 "0600"。这里 Envoy 容器以 uid/gid 101 运行,
+  # Entente 以 root 且 gid 为 101 运行,因此需要给组权限。
   socket_mode: "0660"
 
-# The RDS route_config_names this control plane owns. Each must match a
-# listener's rds.route_config_name in the Envoy bootstrap. There is no default
-# entrypoint: a route that names none, or an undeclared one, is rejected.
+# 本控制平面负责的 RDS route_config_name。每一个都必须与 Envoy bootstrap 里
+# 某个 listener 的 rds.route_config_name 一致。没有默认 entrypoint:
+# 路由不写 entrypoint,或写了未声明的名字,都会被拒绝。
 entrypoints:
   - http
   - https
 
-# Docker source. Remove the whole section to disable it.
+# Docker 来源。删掉整段即关闭。
 docker:
   host: unix:///var/run/docker.sock
-  # Optional, defaults to "entente". Labels are read as <label_prefix>.<key>.
+  # 可选,默认 "entente"。label 按 <label_prefix>.<key> 读取。
   # label_prefix: entente
 
-# Static source, for backends that are not Docker containers.
+# token 文件由 bao agent 或其他机制维护,Entente 不做登录,每次请求前重新读取。
+# 以下字段全部必填,只有 ca_file 可选;openbao 与 secrets 必须一起配置。
+openbao:
+  address: http://openbao:8200
+  token_file: /run/bao/token
+  # HTTPS 使用私有 CA 时指定;省略则使用系统根证书。
+  # ca_file: /run/bao/ca.crt
+  refresh_interval: 5m
+
+# KV v2 中保存 PEM 证书链与私钥;name 对应 Envoy bootstrap 的 SDS 引用。
+# 首次拉取失败则不下发该 secret,引用它的 TLS 入口保持 warming;
+# 后续失败保留上次有效证书并重试,其他 secret 和路由不受影响。
+secrets:
+  - name: demo-cert
+    kv_mount: secret
+    kv_path: entente/demo
+    certificate_field: fullchain
+    private_key_field: key
+
+# 静态来源,用于不是 Docker 容器的后端。
 static:
   backends:
     - name: legacy
-      endpoints:            # IP:port literals only (served over EDS)
+      # 只接受 IP:port 字面量(经 EDS 下发)。
+      endpoints:
         - 172.30.0.50:80
   routes:
     - name: legacy
       entrypoints: [https]
       host: legacy.example.com
       backend: legacy
+      # 可选覆盖;0s 表示不限时,省略则继承 route_timeout。
+      timeout: 0s

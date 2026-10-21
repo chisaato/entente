@@ -4,10 +4,12 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 const minimal = `
 node_id: envoy
+route_timeout: 60s
 xds:
   socket: /run/entente/xds.sock
 entrypoints: [https, http]
@@ -29,6 +31,7 @@ func TestParseMinimal(t *testing.T) {
 func TestParseFull(t *testing.T) {
 	c, err := Parse([]byte(`
 node_id: envoy
+route_timeout: 60s
 xds:
   socket: /run/entente/xds.sock
   socket_mode: "0660"
@@ -95,6 +98,55 @@ func TestRestartRequired(t *testing.T) {
 	c, _ := Parse([]byte(strings.Replace(minimal, "envoy", "envoy-2", 1) + "docker: {host: unix:///d}\n"))
 	if d := RestartRequired(a, c); len(d) != 2 {
 		t.Errorf("RestartRequired = %v, want node_id and docker", d)
+	}
+}
+
+func TestRouteTimeout(t *testing.T) {
+	for _, value := range []string{"60s", "0s", "1.5s"} {
+		t.Run(value, func(t *testing.T) {
+			c, err := Parse([]byte(strings.Replace(minimal, "60s", value, 1) + `
+static:
+  routes:
+    - {name: inherited}
+    - {name: unlimited, timeout: "0s"}
+    - {name: custom, timeout: "2m"}
+`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, _ := time.ParseDuration(value)
+			if c.ParsedRouteTimeout() != want || c.Static.Routes[0].ParsedTimeout() != nil ||
+				c.Static.Routes[1].ParsedTimeout() == nil || *c.Static.Routes[1].ParsedTimeout() != 0 ||
+				c.Static.Routes[2].ParsedTimeout() == nil || *c.Static.Routes[2].ParsedTimeout() != 2*time.Minute {
+				t.Fatalf("unexpected parsed timeouts: %+v", c)
+			}
+			old, err := Parse([]byte(minimal))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := RestartRequired(old, c); len(diff) != 0 {
+				t.Errorf("timeout changes must be hot-reloadable: %v", diff)
+			}
+		})
+	}
+}
+
+func TestInvalidRouteTimeout(t *testing.T) {
+	for name, data := range map[string]string{
+		"missing":         strings.Replace(minimal, "route_timeout: 60s\n", "", 1),
+		"empty":           strings.Replace(minimal, "60s", `""`, 1),
+		"invalid":         strings.Replace(minimal, "60s", "forever", 1),
+		"negative":        strings.Replace(minimal, "60s", "-1s", 1),
+		"overflow":        strings.Replace(minimal, "60s", "999999999999h", 1),
+		"static empty":    minimal + "static: {routes: [{name: bad, timeout: \"\"}]}\n",
+		"static invalid":  minimal + "static: {routes: [{name: bad, timeout: forever}]}\n",
+		"static negative": minimal + "static: {routes: [{name: bad, timeout: -1s}]}\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse([]byte(data)); err == nil || !strings.Contains(err.Error(), "timeout") {
+				t.Fatalf("err = %v, want timeout error", err)
+			}
+		})
 	}
 }
 

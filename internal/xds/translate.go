@@ -1,4 +1,4 @@
-// Package xds turns a model.Model into Envoy xDS resources and serves them.
+// Package xds 把 model.Model 变成 Envoy xDS 资源并提供服务。
 package xds
 
 import (
@@ -7,12 +7,14 @@ import (
 	"encoding/hex"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	"github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/resource/v3"
@@ -20,13 +22,14 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/chisaato/entente/internal/model"
+	"github.com/chisaato/entente/internal/secrets"
 )
 
-// upstreamConnectTimeout is set explicitly on every generated cluster rather
-// than relying on Envoy's built-in default.
+// upstreamConnectTimeout 显式设置在每个生成的 cluster 上,
+// 而不是依赖 Envoy 的内置默认值。
 const upstreamConnectTimeout = 5 * time.Second
 
-// adsSource points a resource at the ADS stream configured in the bootstrap.
+// adsSource 让资源指向 bootstrap 里配置的 ADS 流。
 func adsSource() *core.ConfigSource {
 	return &core.ConfigSource{
 		ResourceApiVersion:    core.ApiVersion_V3,
@@ -34,23 +37,33 @@ func adsSource() *core.ConfigSource {
 	}
 }
 
-// Resources holds the xDS resources for one snapshot, in deterministic order.
+// Resources 保存一份快照的 xDS 资源,顺序是确定的。
 type Resources struct {
 	Clusters  []types.Resource
 	Endpoints []types.Resource
 	Routes    []types.Resource
+	Secrets   []types.Resource
 }
 
-// Translate builds CDS, EDS and RDS resources from m. The model must already
-// be validated and sorted (reconcile.Build guarantees both).
+// Translate 从 m 构建 CDS、EDS 和 RDS 资源。模型必须已经过校验且已排序
+// (reconcile.Build 保证这两点)。
 //
-// Every declared entrypoint gets a RouteConfiguration, even without routes, so
-// Listeners referencing it via RDS never sit waiting for a first response.
-// Each name in placeholders that is not a declared entrypoint gets an empty
-// RouteConfiguration, so listeners Envoy has but the config does not declare
-// serve nothing (404) instead of stale routes.
-func Translate(m *model.Model, placeholders []string) Resources {
+// 每个已声明的 entrypoint 都会得到一份 RouteConfiguration,即使没有路由,
+// 这样通过 RDS 引用它的 Listener 不会一直等第一份响应。
+// placeholders 里每个不是已声明 entrypoint 的名字会得到一份空的
+// RouteConfiguration,于是 Envoy 有、但配置未声明的 listener 什么都不提供
+// (404),而不是继续用过期路由。
+// certificates 中的每一份证书生成一个同名的 SDS Secret。
+func Translate(m *model.Model, placeholders []string, certificates []secrets.Certificate) Resources {
 	var res Resources
+	sorted := slices.Clone(certificates)
+	slices.SortFunc(sorted, func(a, b secrets.Certificate) int { return strings.Compare(a.Name, b.Name) })
+	for _, c := range sorted {
+		res.Secrets = append(res.Secrets, &tlsv3.Secret{Name: c.Name, Type: &tlsv3.Secret_TlsCertificate{TlsCertificate: &tlsv3.TlsCertificate{
+			CertificateChain: &core.DataSource{Specifier: &core.DataSource_InlineBytes{InlineBytes: slices.Clone(c.Certificate)}},
+			PrivateKey:       &core.DataSource{Specifier: &core.DataSource_InlineBytes{InlineBytes: slices.Clone(c.PrivateKey)}},
+		}}})
+	}
 
 	for _, b := range m.Backends {
 		res.Clusters = append(res.Clusters, &cluster.Cluster{
@@ -95,6 +108,7 @@ func Translate(m *model.Model, placeholders []string) Resources {
 					Match: &route.RouteMatch{PathSpecifier: &route.RouteMatch_Prefix{Prefix: "/"}},
 					Action: &route.Route_Route{Route: &route.RouteAction{
 						ClusterSpecifier: &route.RouteAction_Cluster{Cluster: r.Backend},
+						Timeout:          durationpb.New(r.Timeout),
 					}},
 				}},
 			})
@@ -110,33 +124,34 @@ func Translate(m *model.Model, placeholders []string) Resources {
 	return res
 }
 
-// Version is a content hash of the resources. Using content rather than a
-// clock or counter means an unchanged model yields an unchanged version, and
-// a restarted control plane reproduces the version Envoy already has.
+// Version 是资源的内容哈希。用内容而不是时钟或计数器,意味着模型不变则版本不变,
+// 重启后的控制平面会复现 Envoy 已经持有的版本。
 func (r Resources) Version() (string, error) {
 	h := sha256.New()
 	opts := proto.MarshalOptions{Deterministic: true}
-	for _, group := range [][]types.Resource{r.Clusters, r.Endpoints, r.Routes} {
+	for _, group := range [][]types.Resource{r.Clusters, r.Endpoints, r.Routes, r.Secrets} {
 		for _, res := range group {
 			b, err := opts.Marshal(res)
 			if err != nil {
 				return "", err
 			}
-			// Length-prefix each message so concatenation is unambiguous.
+			// 给每条消息加长度前缀,使拼接没有歧义。
 			h.Write(binary.LittleEndian.AppendUint64(nil, uint64(len(b))))
 			h.Write(b)
 		}
-		h.Write([]byte{0xff}) // group separator
+		// 组分隔符。
+		h.Write([]byte{0xff})
 	}
 	return hex.EncodeToString(h.Sum(nil))[:16], nil
 }
 
-// Snapshot builds a consistent cache snapshot for the resources.
+// Snapshot 为这些资源构建一份一致的 cache 快照。
 func (r Resources) Snapshot(version string) (*cache.Snapshot, error) {
 	snap, err := cache.NewSnapshot(version, map[resource.Type][]types.Resource{
 		resource.ClusterType:  r.Clusters,
 		resource.EndpointType: r.Endpoints,
 		resource.RouteType:    r.Routes,
+		resource.SecretType:   r.Secrets,
 	})
 	if err != nil {
 		return nil, err
@@ -147,9 +162,8 @@ func (r Resources) Snapshot(version string) (*cache.Snapshot, error) {
 	return snap, nil
 }
 
-// consistent checks cross-references within the snapshot. The upstream
-// Snapshot.Consistent is not usable here: it expects every RouteConfiguration
-// to be referenced by an LDS listener, but our listeners are static.
+// consistent 检查快照内部的交叉引用。上游的 Snapshot.Consistent 在这里不能用:
+// 它要求每份 RouteConfiguration 都被某个 LDS listener 引用,但我们的 listener 是静态的。
 func (r Resources) consistent() error {
 	clusters := map[string]bool{}
 	for _, res := range r.Clusters {

@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParse(t *testing.T) {
@@ -88,6 +89,28 @@ func TestParse(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("spec = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseTimeout(t *testing.T) {
+	for _, value := range []string{"60s", "0s", "1.5s", "", "-1s", "forever", "999999999999h"} {
+		t.Run(value, func(t *testing.T) {
+			spec, enabled, err := Parse("edge.v2", map[string]string{
+				"edge.v2.enable": "true", "edge.v2.entrypoints": "https",
+				"edge.v2.host": "app.example.com", "edge.v2.port": "80", "edge.v2.timeout": value,
+			})
+			want, parseErr := time.ParseDuration(value)
+			if !enabled {
+				t.Fatal("enabled container was ignored")
+			}
+			if parseErr != nil || want < 0 {
+				if err == nil || !strings.Contains(err.Error(), "edge.v2.timeout") {
+					t.Fatalf("err = %v, want timeout error", err)
+				}
+			} else if err != nil || spec.Timeout == nil || *spec.Timeout != want {
+				t.Fatalf("timeout = %v, err = %v, want %v", spec.Timeout, err, want)
 			}
 		})
 	}

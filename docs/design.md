@@ -28,7 +28,7 @@ Docker 只是其中一个配置来源,YAML 静态配置是另一个(见第 4、8
 
 - 内网穿透 / 隧道层(gost 等)。这是另一条线,不是本项目重点。
 - 任何带参数的中间件和鉴权策略(OAuth、ext_authz 等)。第一版只做反代基础配置。
-- SDS / OpenBao 证书对接,见第 9 节。
+- SDS / OpenBao 证书对接,见第 9 节。(已提前实现 KV 读取,见 12.8。)
 - 增量 xDS。单机规模用全量 snapshot 即可。
 
 ## 2. 总体架构
@@ -130,6 +130,7 @@ label 语义(前缀记作 `<prefix>`):
 <prefix>.host         = "app.example.com"
 <prefix>.port         = "8080"               # 容器内端口
 <prefix>.network      = "<docker network>"   # 容器挂在多张网络上时必填
+<prefix>.timeout      = "60s"                # 可选,非负 Go duration;0s 表示不限时
 # 预留:<prefix>.policy = "<name>"  第一版遇到即拒绝
 ```
 
@@ -209,6 +210,7 @@ MVP 实现过程中做出的决定。标 **[建议]** 的是实现者的判断,�
 - `github.com/envoyproxy/go-control-plane` v0.14.0 + `.../envoy` v1.39.0(拆分后的新模块)。
 - Docker 客户端用 `github.com/moby/moby/client`(`github.com/docker/docker` 已停在 v28,不再更新)。
 - 配置解析 `go.yaml.in/yaml/v3`,热重载 `github.com/fsnotify/fsnotify`。
+- 命令行入口使用 `github.com/spf13/cobra`,只接受 pflag 原生写法。长选项是 `--config`(必填,无默认路径;短选项 `-c`)、`--log-level`(默认 `info`;短选项 `-l`)、`--check`(默认 false,无短选项)。不保留旧的单横线长名(`-config` 等),也不注册 `completion` 子命令,短选项不引入新的默认值。
 - 端到端测试用 `envoyproxy/envoy:v1.39-latest`(实测 1.39.1)。
 
 ### 12.2 所有动态资源走 ADS **[建议]**
@@ -237,6 +239,7 @@ bootstrap 用一条 ADS 流承载 CDS / EDS / RDS(`ads_config` + 各处 `ads: {}
 - 已启用的容器上出现**未知的 `<prefix>.*` label 时拒绝该容器**,防止 `entrypoint`(少了 s)之类的拼写错误被静默忽略。
 - `host` 必须是小写主机名,允许一个前导 `*.` 通配。
 - `port` 必填,不从 EXPOSE 推断。
+- `timeout` 可选,必须是非负 Go duration;非法值拒绝该容器路由,省略时继承顶层 `route_timeout`。
 - `network`:容器只挂一张网络时可省略;挂多张时必填,否则拒绝。容器在该网络上没有 IP(如 `host` 网络)时拒绝。
 - 只看状态为 `running` 的容器,`paused` 的不暴露。
 
@@ -261,8 +264,84 @@ bootstrap 用一条 ADS 流承载 CDS / EDS / RDS(`ads_config` + 各处 `ads: {}
 - **启用了 Docker 来源时,在第一次同步完成前不发布快照**。否则控制平面重启后会先推一份不含 Docker 路由的快照。
   Envoy 在这期间继续使用旧配置(实测重启控制平面期间 40/40 请求返回 200)。
 - **snapshot version** 是全部资源确定性序列化后的 sha256 前 16 位。内容不变则不重发;重启后生成的版本与 Envoy 已有的一致。
-- **热重载**:`entrypoints`、`static`、`docker.label_prefix` 可热更新;`node_id`、`xds.*`、Docker 来源的开关和
+- **热重载**:`entrypoints`、`route_timeout`、`static`、`docker.label_prefix` 可热更新;`node_id`、`xds.*`、Docker 来源的开关和
   `docker.host` 需要重启,改了会被拒绝并打日志。
 - 发现 NACK(Envoy 拒绝配置)和 node id 不匹配时打日志。
 - UDS 在 umask 0177 下创建,再 chmod 成 `socket_mode`,不会短暂出现比配置更宽的权限。
   启动时只会删除遗留的 socket 文件,路径上是普通文件时拒绝启动。
+
+### 12.8 SDS:从 OpenBao KV 读证书 **[建议]**
+
+第 9 节的 SDS 提前实现,只做 **KV v2 读取**,形态对照运维现有的 bao agent 用法
+(agent 用 AppRole 自动登录并把 token 写到 sink 文件,证书以 `fullchain` / `key` 两个字段存在 KV 里)。
+
+- **认证**:Entente 只读一个 token 文件(`openbao.token_file`),每次请求前重新读取,以跟上 agent 的续期 / 重登。
+  不实现任何登录方式。请求头 `X-Vault-Token`。
+- **读取**:`GET {address}/v1/{kv_mount}/data/{kv_path}`,取 `.data.data[certificate_field]` 和
+  `.data.data[private_key_field]`。只用标准库 `net/http`,不引入 OpenBao / Vault SDK。
+  `openbao.ca_file` 可选,缺省时用系统根证书。单次请求超时是代码里的常量 10s。
+- **配置全部显式**:`openbao.address`、`openbao.token_file`、`openbao.refresh_interval`,以及每个 secret 的
+  `name`、`kv_mount`、`kv_path`、`certificate_field`、`private_key_field` 都是必填,没有默认值。
+  有 `secrets` 必须有 `openbao`;有 `openbao` 但没有 `secrets` 也是配置错误。
+- **下发**:每个 secret 生成一个 `envoy.extensions.transport_sockets.tls.v3.Secret`(`tls_certificate`,
+  证书链与私钥用 `inline_bytes`),名字等于配置里的 `name`,和其他资源走同一条 ADS 流。
+  bootstrap 用 `sds_config: { ads: {} }` 按名字引用。证书只在内存里,不落盘;私钥绝不写日志。
+- **校验**:拉到的内容必须通过 `tls.X509KeyPair`(PEM 能解析,私钥与证书匹配),否则视为拉取失败。
+  证书已过期或 7 天内过期时打 WARN。
+- **失败处理(per secret,fail closed)**:
+  - 从未成功拉到过:快照里没有这个 secret。引用它的 Listener / filter chain 在 Envoy 侧保持 warming,不对外提供 TLS。
+  - 之前成功过、这次失败:**保留上一份有效内容**并打 ERROR。证书还没过期时,丢掉它只会让正在工作的 TLS 中断。
+  - 一个 secret 失败不影响其他 secret 和路由。
+- **刷新**:成功后按 `refresh_interval` 轮询(KV v2 没有推送)。失败后按 1s→`refresh_interval` 退避重试。
+  内容不变时快照版本不变(版本哈希包含 secret),不会重复推送。
+- **启动**:与 Docker 一样,配置了 secrets 时,要等每个 secret 都完成第一次拉取(成功或失败)后才发布快照,
+  避免控制平面重启后先推一份缺证书的快照。
+- **热重载**:`secrets` 列表可热更新(新增立即拉取,删除即从快照移除);`openbao.*` 需要重启。
+
+### 12.9 启动顺序与证书缺失(实测,Envoy 1.39)
+
+socket 由 Entente 监听,Envoy 是 gRPC 客户端,连不上会自己退避重连,所以两者的启动顺序无关。
+用 `examples/` 这套栈实测(Envoy 先起,`initial_fetch_timeout` 用默认值 15s):
+
+| 阶段 | http(无 TLS) | https(SDS 证书) |
+|---|---|---|
+| 只有 Envoy,0–30s | 端口未监听 | 端口未监听 |
+| 只有 Envoy,30s 后 | 404 | 握手失败 |
+| Entente 已起,KV 里没有证书 | 约 3s 后 200 | 握手失败 |
+| 写入 KV 后 | 200 | 约 9s 后 200(等 Entente 的重试退避) |
+
+- 只有 Envoy 时,前 30s 端口不监听:CDS 的 initial fetch 先超时 15s,之后 RDS 和 SDS 再各等 15s。
+  想缩短这段时间,要在 bootstrap 里显式设置 `initial_fetch_timeout`。
+- 缺失的 SDS 证书只让引用它的 filter chain 握手失败,不影响同一个 Envoy 里的其他 listener。
+
+### 12.10 SNI 分流与兜底证书 **[建议]**
+
+目标:防 SNI 探测(扫描器拿不到真证书和它的 SAN),以及兜底(控制平面或 OpenBao 不可用时,443 仍能完成握手,
+返回明确的错误,而不是连不上)。
+
+- **全部在 Envoy bootstrap 里做,Entente 不参与**(listener 是静态的,见第 2 节):
+  - 真证书:每条 filter chain 用 `filter_chain_match.server_names` 匹配域名,证书走 SDS(12.8)。
+  - 兜底:`default_filter_chain` 接住 SNI 不匹配和不带 SNI 的连接。它的证书是 bootstrap 里的**静态 secret**,
+    HCM 用内联 `route_config`,对所有请求 `direct_response` 返回 **421 Misdirected Request**。
+    兜底链不依赖 Entente、不依赖 OpenBao,Envoy 一监听就能用。
+- **兜底证书不走 SDS**:12.9 实测表明,Entente 没起来时 SDS 证书拿不到,走 SDS 的兜底链也会握手失败。
+- 真证书缺失时**不会**退到兜底证书:那条 filter chain 自己握手失败(fail closed),不掩盖故障。
+- **`entente gen-cert` 子命令**生成兜底用的随机自签证书,省去手写 openssl 命令:
+  - ECDSA P-256 私钥,序列号随机。CN 和 SAN 都是 `--common-name`,默认 `invalid`
+    (RFC 6761 保留域名,不会撞上真实域名)。有效期 `--days`,默认 3650。
+    这里有默认值:证书本身不承载任何安全或路由决策,"明确配置"原则针对的是路由和安全。
+  - 默认向 stdout 输出一段可直接贴进 bootstrap `static_resources.secrets` 的 YAML(`inline_string`),
+    secret 名由必填的 `--name` 指定。
+  - `--out-dir <dir>` 改为写 `tls.crt`(0644)和 `tls.key`(0600)两个 PEM 文件,目标文件已存在则拒绝覆盖。
+  - 不需要 `--config`,不连接任何服务。
+
+### 12.11 路由超时 **[建议]**
+
+- 顶层 `route_timeout` 必填,使用非负 Go duration 字符串,不沿用 Envoy 隐式的 15s:
+  隐含超时违背明确配置原则,也可能截断 Vaultwarden 大附件等耗时请求。
+- 优先级:静态路由 `static.routes[].timeout` 或 Docker `<prefix>.timeout` 覆盖顶层 `route_timeout`;
+  只有省略覆盖值才继承。`0s` 表示不限时,始终显式下发 Envoy RouteAction 的 `timeout`,包括零值。
+- YAML 中缺失顶层值或任意超时非法属于文件级错误;label 超时非法只拒绝该容器路由。
+  顶层值与静态覆盖值均支持热重载,内容变化自然改变快照哈希。
+- WebSocket 由 bootstrap HCM 的 `upgrade_configs` 负责,Entente 不管理升级配置。
+- 超时属于路由行为而非安全决策,因此允许通过 label 配置,不受 Policy 所有权限制。

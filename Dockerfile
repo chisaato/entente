@@ -12,4 +12,4 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
 FROM gcr.io/distroless/static-debian12
 COPY --from=build /out/entente /usr/local/bin/entente
 ENTRYPOINT ["/usr/local/bin/entente"]
-CMD ["-config", "/etc/entente/entente.yaml"]
+CMD ["--config", "/etc/entente/entente.yaml"]

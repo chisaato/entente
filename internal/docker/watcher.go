@@ -1,8 +1,8 @@
-// Package docker watches the Docker Engine and reports the running containers.
+// Package docker 监视 Docker Engine 并报告正在运行的容器。
 //
-// The watcher is level-triggered: every relevant event only marks the state
-// dirty, and a debounced full ContainerList produces the new picture. This
-// makes event storms cheap and missed events harmless.
+// watcher 是 level-triggered 的:每个相关事件只把状态标脏,
+// 防抖后的一次完整 ContainerList 给出新画面。
+// 这样事件风暴代价很低,漏掉的事件也无害。
 package docker
 
 import (
@@ -18,19 +18,18 @@ import (
 	"github.com/moby/moby/client"
 )
 
-// Container is the subset of container state the reconciler needs.
+// Container 是 reconciler 需要的那一部分容器状态。
 type Container struct {
 	ID     string
 	Name   string
 	Labels map[string]string
-	// Networks maps Docker network name to the container's IPv4 (or, when no
-	// IPv4 is assigned, global IPv6) address on it. Networks without an
-	// address (e.g. "host" or "none") map to an invalid netip.Addr.
+	// Networks 把 Docker 网络名映射到容器在该网络上的 IPv4
+	// (没有 IPv4 时则用全局 IPv6)地址。没有地址的网络
+	// (例如 "host" 或 "none")映射为无效的 netip.Addr。
 	Networks map[string]netip.Addr
 }
 
-// Watcher lists running containers and re-lists them whenever Docker reports
-// a relevant change.
+// Watcher 列出正在运行的容器,并在 Docker 报告相关变化时重新列出。
 type Watcher struct {
 	cli      *client.Client
 	log      *slog.Logger
@@ -38,9 +37,8 @@ type Watcher struct {
 	onSync   func([]Container)
 }
 
-// NewWatcher connects to the Docker Engine at host. onSync is called from the
-// watcher goroutine with the full list of running containers after every
-// successful sync.
+// NewWatcher 连接到 host 上的 Docker Engine。每次同步成功后,
+// onSync 在 watcher goroutine 里被调用,参数是全部正在运行的容器。
 func NewWatcher(host string, log *slog.Logger, onSync func([]Container)) (*Watcher, error) {
 	cli, err := client.New(client.WithHost(host))
 	if err != nil {
@@ -49,11 +47,11 @@ func NewWatcher(host string, log *slog.Logger, onSync func([]Container)) (*Watch
 	return &Watcher{cli: cli, log: log, debounce: 250 * time.Millisecond, onSync: onSync}, nil
 }
 
-// Close releases the Docker client.
+// Close 释放 Docker 客户端。
 func (w *Watcher) Close() error { return w.cli.Close() }
 
-// Run watches until ctx is cancelled. Connection failures are retried with
-// backoff; the last successful sync stays in effect meanwhile.
+// Run 一直监视到 ctx 被取消。连接失败会按退避重试;
+// 在此期间保留上一次成功同步的结果。
 func (w *Watcher) Run(ctx context.Context) {
 	backoff := time.Second
 	for ctx.Err() == nil {
@@ -75,8 +73,7 @@ func (w *Watcher) Run(ctx context.Context) {
 	}
 }
 
-// relevantActions are the events after which the set of running containers,
-// their labels or their addresses may have changed.
+// relevantActions 是那些之后,正在运行的容器集合、它们的 label 或地址可能已变化的事件。
 var relevantActions = map[events.Action]bool{
 	events.ActionStart:      true,
 	events.ActionRestart:    true,
@@ -92,15 +89,14 @@ var relevantActions = map[events.Action]bool{
 	events.ActionDisconnect: true,
 }
 
-// session subscribes to events, performs an initial sync, then re-syncs on
-// relevant events until the stream fails.
+// session 订阅事件,先做一次初始同步,然后在相关事件上重新同步,直到流失败。
 func (w *Watcher) session(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	filters := client.Filters{}.
 		Add("type", string(events.ContainerEventType), string(events.NetworkEventType))
-	// Subscribe before listing so nothing that happens during the list is lost.
+	// 先订阅再 list,这样 list 期间发生的变化不会丢。
 	sub := w.cli.Events(ctx, client.EventsListOptions{Filters: filters})
 
 	if err := w.sync(ctx); err != nil {

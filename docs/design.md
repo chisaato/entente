@@ -28,7 +28,7 @@ Docker 只是其中一个配置来源,YAML 静态配置是另一个(见第 4、8
 
 - 内网穿透 / 隧道层(gost 等)。这是另一条线,不是本项目重点。
 - 任何带参数的中间件和鉴权策略(OAuth、ext_authz 等)。第一版只做反代基础配置。
-- SDS / OpenBao 证书对接,见第 9 节。(已提前实现 KV 读取,见 12.8。)
+- SDS / OpenBao 证书对接,见第 9 节。(已提前实现 KV 读取,见 12.8;本地 PEM 文件来源见 12.12。)
 - 增量 xDS。单机规模用全量 snapshot 即可。
 
 ## 2. 总体架构
@@ -280,9 +280,10 @@ bootstrap 用一条 ADS 流承载 CDS / EDS / RDS(`ads_config` + 各处 `ads: {}
 - **读取**:`GET {address}/v1/{kv_mount}/data/{kv_path}`,取 `.data.data[certificate_field]` 和
   `.data.data[private_key_field]`。只用标准库 `net/http`,不引入 OpenBao / Vault SDK。
   `openbao.ca_file` 可选,缺省时用系统根证书。单次请求超时是代码里的常量 10s。
-- **配置全部显式**:`openbao.address`、`openbao.token_file`、`openbao.refresh_interval`,以及每个 secret 的
+- **配置全部显式**:`openbao.address`、`openbao.token_file`、`openbao.refresh_interval`,以及每个 KV secret 的
   `name`、`kv_mount`、`kv_path`、`certificate_field`、`private_key_field` 都是必填,没有默认值。
-  有 `secrets` 必须有 `openbao`;有 `openbao` 但没有 `secrets` 也是配置错误。
+  有 KV 来源必须有 `openbao`;有 `openbao` 但没有任何 secret 也是配置错误。
+  只从本地文件读证书时不要配置 `openbao`,见 12.12。
 - **下发**:每个 secret 生成一个 `envoy.extensions.transport_sockets.tls.v3.Secret`(`tls_certificate`,
   证书链与私钥用 `inline_bytes`),名字等于配置里的 `name`,和其他资源走同一条 ADS 流。
   bootstrap 用 `sds_config: { ads: {} }` 按名字引用。证书只在内存里,不落盘;私钥绝不写日志。
@@ -345,3 +346,35 @@ socket 由 Entente 监听,Envoy 是 gRPC 客户端,连不上会自己退避重�
   顶层值与静态覆盖值均支持热重载,内容变化自然改变快照哈希。
 - WebSocket 由 bootstrap HCM 的 `upgrade_configs` 负责,Entente 不管理升级配置。
 - 超时属于路由行为而非安全决策,因此允许通过 label 配置,不受 Policy 所有权限制。
+
+### 12.12 SDS:从本地 PEM 文件读证书 **[已定]**
+
+给不跑 OpenBao 的部署用,例如 acme.sh 把 `fullchain.pem` / `key.pem` 写到磁盘,Entente 读入内存后经同一条 ADS SDS 流推给 Envoy。
+文件来源不发 HTTP,也不连接 OpenBao。KV 来源的行为仍是 12.8,两种来源可以列在同一份 `secrets` 里,但每个 secret 只能有一种。
+
+```yaml
+secrets:
+  - name: demo-cert
+    file:
+      certificate_chain: /etc/acme/demo.example.com/fullchain.pem
+      private_key: /etc/acme/demo.example.com/key.pem
+```
+
+- **来源互斥**:原有 KV 字段保持不变。`file` 与任一 KV 字段同时出现则拒绝;两个都没有也拒绝。
+  `name` 在整份列表里唯一,和来源无关。
+- **路径必填且必须是绝对路径**。相对路径会跟着进程工作目录变,等于隐含配置。
+  不在配置里写轮询间隔或防抖时间;下面的时间是代码常量,和 OpenBao 的 10s 请求超时同一类。
+- **OpenBao**:只有存在 KV 来源时才必填。纯 file 配置不创建 HTTP 客户端。
+  配了 `openbao` 但一个 secret 都没有,仍然是配置错误。`openbao.*` 继续需要重启;文件路径跟 `secrets` 列表一样热重载。
+- **读取**:启动后立刻读,不等文件系统事件。监听的是两个文件的父目录,所以原地覆盖和
+  `写入临时文件再 rename` 都能看见。同一目录只监听一次。相关事件按 250ms 合并后再读,避免证书链和私钥
+  各写一次就读到半对新。
+- **不能只等一个事件**:父目录还不存在时 `inotify` 无事可看。读取或监听失败后按 1s→30s 退避重试,
+  目录或文件后来出现就会补上监听并重新读取。监听正常时每 30s 也重读一次,防止目录被整个替换后盯着旧 inode。
+- **校验和失败(per secret,与 12.8 相同)**:两个文件都要能通过 `tls.X509KeyPair` 才成对下发。
+  只换了证书、私钥还是旧的,视为失败。首次失败不下发;已有一份有效证书时保留它。一个 secret 失败不影响其他 secret。
+  日志只写 secret 名、路径和固定错误,不写 PEM。
+- **版本**:证书链或私钥字节变了,快照哈希才变。文件时间戳变了但内容相同,不推新版本。
+  从配置里删掉该 secret 会立刻从快照移除,不等待文件删除。
+- **热重载路径**:同名 secret 换路径时,新文件还没读成功就继续下发上一份有效内容。每个 secret 一个 goroutine,
+  取消配置即关闭它的 watcher。

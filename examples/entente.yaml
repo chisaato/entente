@@ -40,6 +40,12 @@ openbao:
 # KV v2 中保存 PEM 证书链与私钥;name 对应 Envoy bootstrap 的 SDS 引用。
 # 首次拉取失败则不下发该 secret,引用它的 TLS 入口保持 warming;
 # 后续失败保留上次有效证书并重试,其他 secret 和路由不受影响。
+# 每个 secret 只能有一种来源。不用 OpenBao 时删掉上面的 openbao 段,改为本地绝对路径:
+#   - name: demo-cert
+#     file:
+#       certificate_chain: /etc/acme/demo.example.com/fullchain.pem
+#       private_key: /etc/acme/demo.example.com/key.pem
+# 文件来源启动时立即读取,并监听父目录(兼容原地写入和 rename 替换)。
 secrets:
   - name: demo-cert
     kv_mount: secret

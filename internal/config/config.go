@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -56,12 +57,57 @@ type OpenBao struct {
 	RefreshInterval string `yaml:"refresh_interval"`
 }
 
+// SecretFile 是本地 PEM 文件来源。两个路径都必填,且必须是绝对路径。
+type SecretFile struct {
+	CertificateChain string `yaml:"certificate_chain"`
+	PrivateKey       string `yaml:"private_key"`
+}
+
 type Secret struct {
 	Name             string `yaml:"name"`
 	KVMount          string `yaml:"kv_mount"`
 	KVPath           string `yaml:"kv_path"`
 	CertificateField string `yaml:"certificate_field"`
 	PrivateKeyField  string `yaml:"private_key_field"`
+	// File 与上面的 KV 字段互斥。指针用来区分“未配置”和空对象。
+	File *SecretFile `yaml:"file"`
+}
+
+// Equal 按来源内容比较。File 是指针,不能用结构体相等,否则每次重新解析 YAML 都会被当成新配置。
+func (s Secret) Equal(o Secret) bool {
+	if s.Name != o.Name || s.KVMount != o.KVMount || s.KVPath != o.KVPath || s.CertificateField != o.CertificateField || s.PrivateKeyField != o.PrivateKeyField {
+		return false
+	}
+	if (s.File == nil) != (o.File == nil) {
+		return false
+	}
+	if s.File == nil {
+		return true
+	}
+	return *s.File == *o.File
+}
+
+// SecretsEqual 按顺序比较 secret 列表。顺序变化视为配置变化。
+func SecretsEqual(a, b []Secret) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !a[i].Equal(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// UsesKV 报告这个 secret 是否写了任一 OpenBao KV 字段。
+func (s Secret) UsesKV() bool {
+	for _, value := range []string{s.KVMount, s.KVPath, s.CertificateField, s.PrivateKeyField} {
+		if strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 type XDS struct {
@@ -206,8 +252,39 @@ func (c *Config) validate() error {
 	}
 
 	seen = map[string]bool{}
-	if len(c.Secrets) > 0 && c.OpenBao == nil {
-		add("openbao is required when secrets are configured")
+	kvSecrets := 0
+	for i, s := range c.Secrets {
+		if !nameRe.MatchString(s.Name) {
+			add("secrets[%d]: invalid name %q", i, s.Name)
+		}
+		if seen[s.Name] {
+			add("secret %q declared twice", s.Name)
+		}
+		seen[s.Name] = true
+		switch {
+		case s.UsesKV() && s.File != nil:
+			add("secrets[%d]: exactly one of kv fields or file is allowed", i)
+		case s.File != nil:
+			if strings.TrimSpace(s.File.CertificateChain) == "" || !filepath.IsAbs(s.File.CertificateChain) {
+				add("secrets[%d].file.certificate_chain must be a non-empty absolute path", i)
+			}
+			if strings.TrimSpace(s.File.PrivateKey) == "" || !filepath.IsAbs(s.File.PrivateKey) {
+				add("secrets[%d].file.private_key must be a non-empty absolute path", i)
+			}
+		case s.UsesKV():
+			kvSecrets++
+			for field, value := range map[string]string{"kv_mount": s.KVMount, "kv_path": s.KVPath, "certificate_field": s.CertificateField, "private_key_field": s.PrivateKeyField} {
+				if strings.TrimSpace(value) == "" {
+					add("secrets[%d].%s is required", i, field)
+				}
+			}
+		default:
+			add("secrets[%d]: exactly one certificate source is required", i)
+		}
+	}
+	// 只有 KV 来源才需要 OpenBao。纯 file 配置不得为此去连 OpenBao。
+	if kvSecrets > 0 && c.OpenBao == nil {
+		add("openbao is required when a secret reads from kv")
 	}
 	if c.OpenBao != nil {
 		if len(c.Secrets) == 0 {
@@ -221,20 +298,6 @@ func (c *Config) validate() error {
 		}
 		if d, err := time.ParseDuration(c.OpenBao.RefreshInterval); err != nil || d <= 0 {
 			add("openbao.refresh_interval must be a positive Go duration")
-		}
-	}
-	for i, s := range c.Secrets {
-		if !nameRe.MatchString(s.Name) {
-			add("secrets[%d]: invalid name %q", i, s.Name)
-		}
-		if seen[s.Name] {
-			add("secret %q declared twice", s.Name)
-		}
-		seen[s.Name] = true
-		for field, value := range map[string]string{"kv_mount": s.KVMount, "kv_path": s.KVPath, "certificate_field": s.CertificateField, "private_key_field": s.PrivateKeyField} {
-			if strings.TrimSpace(value) == "" {
-				add("secrets[%d].%s is required", i, field)
-			}
 		}
 	}
 	seen = map[string]bool{}

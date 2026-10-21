@@ -127,15 +127,13 @@ func run(cfg *config.Config, configPath string, log *slog.Logger) error {
 		go func() { defer wg.Done(); f() }()
 	}
 
-	var secretManager *secrets.Manager
-	if cfg.OpenBao != nil {
-		var err error
-		secretManager, err = secrets.New(*cfg.OpenBao, cfg.Secrets, log.With("component", "secrets"), rec.SetSecrets)
-		if err != nil {
-			return fmt.Errorf("openbao: %w", err)
-		}
-		goRun(func() { secretManager.Run(ctx) })
+	// 没有 OpenBao 时也要跑:纯文件证书、以及之后热加进来的文件证书都走这里。
+	// New 只有在 OpenBao 段本身不合法时才失败,文件来源不建立 HTTP 客户端。
+	secretManager, err := secrets.New(cfg.OpenBao, cfg.Secrets, log.With("component", "secrets"), rec.SetSecrets)
+	if err != nil {
+		return fmt.Errorf("openbao: %w", err)
 	}
+	goRun(func() { secretManager.Run(ctx) })
 
 	if cfg.Docker != nil {
 		w, err := docker.NewWatcher(cfg.Docker.Host, log.With("component", "docker"), rec.SetContainers)
@@ -158,9 +156,7 @@ func run(cfg *config.Config, configPath string, log *slog.Logger) error {
 			current = next
 			log.Info("config reloaded")
 			rec.SetConfig(next)
-			if secretManager != nil {
-				secretManager.SetSecrets(next.Secrets)
-			}
+			secretManager.SetSecrets(next.Secrets)
 		})
 		if err != nil {
 			log.Error("config watcher stopped; hot reload disabled", "err", err)
@@ -171,7 +167,6 @@ func run(cfg *config.Config, configPath string, log *slog.Logger) error {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve() }()
 
-	var err error
 	select {
 	case <-ctx.Done():
 		log.Info("shutting down")

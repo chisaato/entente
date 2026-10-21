@@ -1,7 +1,9 @@
-// Package secrets 从 OpenBao KV v2 读取并在内存中保留最后一份有效证书。
+// Package secrets 从 OpenBao KV v2 或本地 PEM 文件读取证书,并在内存中保留最后一份有效内容。
+// 私钥只存在于内存中的 Certificate 里,任何日志都不得输出证书或私钥字节。
 package secrets
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -37,7 +39,7 @@ type state struct {
 
 type Manager struct {
 	mu       sync.Mutex
-	cfg      config.OpenBao
+	cfg      *config.OpenBao
 	client   *http.Client
 	interval time.Duration
 	log      *slog.Logger
@@ -47,34 +49,41 @@ type Manager struct {
 	wg       sync.WaitGroup
 }
 
-// New 创建读取器。onChange 的第二个参数表示当前列表均已完成首次尝试。
-func New(cfg config.OpenBao, definitions []config.Secret, log *slog.Logger, onChange func([]Certificate, bool)) (*Manager, error) {
-	interval, err := time.ParseDuration(cfg.RefreshInterval)
-	if err != nil || interval <= 0 {
-		return nil, fmt.Errorf("invalid openbao refresh interval")
-	}
-	u, err := url.Parse(cfg.Address)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return nil, fmt.Errorf("invalid openbao address")
-	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if cfg.CAFile != "" {
-		pem, err := os.ReadFile(cfg.CAFile)
-		if err != nil {
-			return nil, fmt.Errorf("reading openbao CA: %w", err)
+// New 创建读取器。cfg 为 nil 时只服务本地文件来源,不建立 HTTP 客户端。
+// onChange 的第二个参数表示当前列表均已完成首次尝试。
+func New(cfg *config.OpenBao, definitions []config.Secret, log *slog.Logger, onChange func([]Certificate, bool)) (*Manager, error) {
+	m := &Manager{log: log, onChange: onChange, states: map[string]*state{}}
+	if cfg != nil {
+		interval, err := time.ParseDuration(cfg.RefreshInterval)
+		if err != nil || interval <= 0 {
+			return nil, fmt.Errorf("invalid openbao refresh interval")
 		}
-		roots, err := x509.SystemCertPool()
-		if err != nil {
-			roots = x509.NewCertPool()
+		u, err := url.Parse(cfg.Address)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			return nil, fmt.Errorf("invalid openbao address")
 		}
-		if !roots.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("openbao CA file contains no certificates")
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		if cfg.CAFile != "" {
+			pem, err := os.ReadFile(cfg.CAFile)
+			if err != nil {
+				return nil, fmt.Errorf("reading openbao CA: %w", err)
+			}
+			roots, err := x509.SystemCertPool()
+			if err != nil {
+				roots = x509.NewCertPool()
+			}
+			if !roots.AppendCertsFromPEM(pem) {
+				return nil, fmt.Errorf("openbao CA file contains no certificates")
+			}
+			transport.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
 		}
-		transport.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
+		copied := *cfg
+		m.cfg = &copied
+		m.interval = interval
+		m.client = &http.Client{Transport: transport, Timeout: requestTimeout,
+			// 不跟随重定向,避免把 token 转发到其他地址。
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	}
-	m := &Manager{cfg: cfg, interval: interval, client: &http.Client{Transport: transport, Timeout: requestTimeout,
-		// 不跟随重定向,避免把 token 转发到其他地址。
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, log: log, onChange: onChange, states: map[string]*state{}}
 	m.SetSecrets(definitions)
 	return m, nil
 }
@@ -86,7 +95,7 @@ func (m *Manager) SetSecrets(definitions []config.Secret) {
 	next := make(map[string]*state, len(definitions))
 	for _, d := range definitions {
 		s := m.states[d.Name]
-		if s == nil || s.definition != d {
+		if s == nil || !s.definition.Equal(d) {
 			// 同名配置迁移读取位置时,失败仍保留上一份有效内容。
 			var previous *Certificate
 			if s != nil {
@@ -125,14 +134,23 @@ func (m *Manager) Run(ctx context.Context) {
 	m.ctx = nil
 	m.mu.Unlock()
 	m.wg.Wait()
-	m.client.CloseIdleConnections()
+	if m.client != nil {
+		m.client.CloseIdleConnections()
+	}
 }
 
 func (m *Manager) start(s *state) {
 	ctx, cancel := context.WithCancel(m.ctx)
 	s.cancel = cancel
 	m.wg.Add(1)
-	go func() { defer m.wg.Done(); m.poll(ctx, s) }()
+	go func() {
+		defer m.wg.Done()
+		if s.definition.File != nil {
+			m.watchFiles(ctx, s)
+			return
+		}
+		m.poll(ctx, s)
+	}()
 }
 
 // notify 在锁内串行回调,保证旧任务无法覆盖新列表的状态。
@@ -155,34 +173,20 @@ func (m *Manager) notify() {
 }
 
 func (m *Manager) poll(ctx context.Context, s *state) {
+	if m.interval <= 0 {
+		m.store(s, Certificate{}, fmt.Errorf("openbao is not configured"), "fetching secret")
+		<-ctx.Done()
+		return
+	}
 	backoff := min(time.Second, m.interval)
 	for {
 		c, err := m.fetch(ctx, s.definition)
 		if ctx.Err() != nil {
 			return
 		}
-		m.mu.Lock()
-		if m.states[s.definition.Name] != s {
-			m.mu.Unlock()
+		if !m.store(s, c, err, "fetching secret") {
 			return
 		}
-		changed := !s.attempted
-		s.attempted = true
-		if err != nil {
-			// 从未成功时没有"上一份"可保留,日志不能暗示证书已在下发
-			if s.certificate == nil {
-				m.log.Error("fetching secret; no valid certificate yet, not served", "secret", s.definition.Name, "err", err)
-			} else {
-				m.log.Error("fetching secret; keeping last valid certificate", "secret", s.definition.Name, "err", err)
-			}
-		} else {
-			changed = changed || s.certificate == nil || !slices.Equal(c.Certificate, s.certificate.Certificate) || !slices.Equal(c.PrivateKey, s.certificate.PrivateKey)
-			s.certificate = &c
-		}
-		if changed {
-			m.notify()
-		}
-		m.mu.Unlock()
 		delay := m.interval
 		if err != nil {
 			delay = backoff
@@ -202,6 +206,9 @@ func (m *Manager) poll(ctx context.Context, s *state) {
 
 func (m *Manager) fetch(ctx context.Context, d config.Secret) (Certificate, error) {
 	var empty Certificate
+	if m.cfg == nil || m.client == nil {
+		return empty, fmt.Errorf("openbao is not configured")
+	}
 	token, err := os.ReadFile(m.cfg.TokenFile)
 	if err != nil {
 		return empty, fmt.Errorf("reading openbao token file: %w", err)
@@ -237,7 +244,46 @@ func (m *Manager) fetch(ctx context.Context, d config.Secret) (Certificate, erro
 	if !okCert || !okKey || strings.TrimSpace(cert) == "" || strings.TrimSpace(key) == "" {
 		return empty, fmt.Errorf("certificate fields must be non-empty strings")
 	}
-	pair, err := tls.X509KeyPair([]byte(cert), []byte(key))
+	return parsePair(m.log, d.Name, []byte(cert), []byte(key))
+}
+
+// store 在确认 s 仍是当前任务后更新 last-good。返回 false 表示任务已被替换,调用方应退出。
+// 证书内容不变且已经尝试过时不回调,避免相同字节再发一份快照。
+func (m *Manager) store(s *state, c Certificate, err error, action string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.states[s.definition.Name] != s {
+		return false
+	}
+	changed := !s.attempted
+	s.attempted = true
+	if err != nil {
+		// 从未成功时没有"上一份"可保留,日志不能暗示证书已在下发。
+		if s.certificate == nil {
+			m.log.Error(action+"; no valid certificate yet, not served", "secret", s.definition.Name, "err", err)
+		} else {
+			m.log.Error(action+"; keeping last valid certificate", "secret", s.definition.Name, "err", err)
+		}
+	} else {
+		changed = changed || s.certificate == nil || !slices.Equal(c.Certificate, s.certificate.Certificate) || !slices.Equal(c.PrivateKey, s.certificate.PrivateKey)
+		if changed {
+			copied := c
+			s.certificate = &copied
+		}
+	}
+	if changed {
+		m.notify()
+	}
+	return true
+}
+
+// parsePair 校验 PEM 证书链与私钥成对、可解析。失败信息是固定文本,不包含文件内容。
+func parsePair(log *slog.Logger, name string, certPEM, keyPEM []byte) (Certificate, error) {
+	var empty Certificate
+	if len(bytes.TrimSpace(certPEM)) == 0 || len(bytes.TrimSpace(keyPEM)) == 0 {
+		return empty, fmt.Errorf("certificate and private key must be non-empty")
+	}
+	pair, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		return empty, fmt.Errorf("invalid TLS certificate or mismatched private key")
 	}
@@ -246,7 +292,7 @@ func (m *Manager) fetch(ctx context.Context, d config.Secret) (Certificate, erro
 		return empty, fmt.Errorf("invalid leaf certificate")
 	}
 	if time.Until(leaf.NotAfter) <= 7*24*time.Hour {
-		m.log.Warn("TLS certificate expired or expires within seven days", "secret", d.Name, "not_after", leaf.NotAfter)
+		log.Warn("TLS certificate expired or expires within seven days", "secret", name, "not_after", leaf.NotAfter)
 	}
-	return Certificate{Name: d.Name, Certificate: []byte(cert), PrivateKey: []byte(key)}, nil
+	return Certificate{Name: name, Certificate: bytes.Clone(certPEM), PrivateKey: bytes.Clone(keyPEM)}, nil
 }

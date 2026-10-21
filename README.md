@@ -1,7 +1,7 @@
 # Entente
 
 Envoy 的外挂控制平面。它读取 Docker 容器 label 和静态 YAML,通过 Unix socket 上的 xDS(CDS / EDS / RDS / SDS)
-把路由和 OpenBao 中的证书推给 Envoy。效果类似 Traefik 的 Docker provider:给容器贴上 label,路由就自动出现;数据面是 Envoy。
+把路由和证书推给 Envoy。证书来自 OpenBao KV,或本地 PEM 文件。效果类似 Traefik 的 Docker provider:给容器贴上 label,路由就自动出现;数据面是 Envoy。
 
 面向不跑 Kubernetes 的单机部署。设计见 [docs/design.md](docs/design.md)。
 
@@ -9,7 +9,7 @@ Envoy 的外挂控制平面。它读取 Docker 容器 label 和静态 YAML,通�
 
 - **Envoy bootstrap(运维手写)**:监听端口、TLS、filter chain。Entente 不使用 LDS,也不创建端口。
 - **Entente**:每个声明的入口(即 bootstrap 里的 `rds.route_config_name`)推送一份 RouteConfiguration,
-  每个后端推送一个 EDS cluster,从 OpenBao KV v2 读取证书并通过 SDS 下发。
+  每个后端推送一个 EDS cluster,从 OpenBao KV v2 或本地 PEM 文件读取证书并通过 SDS 下发。
 
 没有任何默认入口,也没有隐含默认值:容器不写 `entrypoints` 就不会被暴露,引用了未声明入口的路由会被拒绝。
 
@@ -79,6 +79,26 @@ Entente 每次请求前重新读取 token 文件,不实现登录;生产环境可
 若 agent 通过替换文件更新 token,应挂载 sink 所在目录,避免单文件 bind mount 继续引用旧 inode。
 首次拉取失败时不下发该 secret,对应 TLS 入口保持 warming;后续失败保留上一份有效证书并重试。
 `secrets` 列表支持热重载,`openbao.*` 需要重启。完整语义见[设计文档 12.8 节](docs/design.md#128-sds从-openbao-kv-读证书)。
+
+### 本地 PEM 文件
+
+不使用 OpenBao 时,删掉 `openbao` 段,改为:
+
+```yaml
+secrets:
+  - name: demo-cert
+    file:
+      certificate_chain: /etc/acme/demo.example.com/fullchain.pem
+      private_key: /etc/acme/demo.example.com/key.pem
+```
+
+两个路径都必须是绝对路径。每个 secret 只能有一种来源:KV 字段和 `file` 不能同时写,名字也不能重复。
+只有存在 KV 来源时才需要 `openbao`;配了 `openbao` 但一个 secret 都没有仍然是错误。
+
+Entente 启动时立即读取,并监听这两个文件的父目录,因此 acme.sh 原地覆盖或先写临时文件再 rename 都会被看到。
+证书和私钥必须成对通过校验后才下发;只更新了其中一个时保留上一份有效证书。目录或文件稍后出现会重试恢复,不依赖某一次文件系统事件。
+内容不变不推新快照;从配置删除该 secret 会立刻撤销。私钥不会写入日志,也不会为此发起 HTTP 请求。
+语义见[设计文档 12.12 节](docs/design.md#1212-sds从本地-pem-文件读证书-已定)。
 
 ### SNI 兜底与自签证书
 

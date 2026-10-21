@@ -63,3 +63,73 @@ func TestOpenBaoRestartRequired(t *testing.T) {
 		t.Error("disabling openbao must require restart")
 	}
 }
+
+const fileYAML = `
+secrets:
+  - name: example-cert
+    file:
+      certificate_chain: /certs/fullchain.pem
+      private_key: /certs/key.pem
+`
+
+func TestFileSecretValidation(t *testing.T) {
+	valid := minimal + fileYAML
+	parsed, err := Parse([]byte(valid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.OpenBao != nil {
+		t.Fatal("file source must not require openbao")
+	}
+	again, err := Parse([]byte(valid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !SecretsEqual(parsed.Secrets, again.Secrets) {
+		t.Fatal("reparsed file secrets must compare equal")
+	}
+	withBao, err := Parse([]byte(valid + baoYAML))
+	if err != nil {
+		t.Fatal("openbao plus file secrets should parse")
+	}
+	if withBao.OpenBao == nil || withBao.Secrets[0].File == nil {
+		t.Fatal("openbao and file source were not both kept")
+	}
+	mixed := minimal + baoYAML + `
+secrets:
+  - name: from-kv
+    kv_mount: secret
+    kv_path: entente/demo
+    certificate_field: fullchain
+    private_key_field: key
+  - name: from-file
+    file: {certificate_chain: /certs/fullchain.pem, private_key: /certs/key.pem}
+`
+	if _, err := Parse([]byte(mixed)); err != nil {
+		t.Fatal(err)
+	}
+	for name, yaml := range map[string]string{
+		"relative chain": strings.Replace(valid, "/certs/fullchain.pem", "certs/fullchain.pem", 1),
+		"relative key":   strings.Replace(valid, "/certs/key.pem", "key.pem", 1),
+		"blank chain":    strings.Replace(valid, "/certs/fullchain.pem", "\" \"", 1),
+		"missing chain":  strings.Replace(valid, "      certificate_chain: /certs/fullchain.pem\n", "", 1),
+		"missing key":    strings.Replace(valid, "      private_key: /certs/key.pem\n", "", 1),
+		"mixed fields":   strings.Replace(valid, "    file:\n", "    kv_mount: secret\n    file:\n", 1),
+		"no source":      minimal + "secrets: [{name: example-cert}]\n",
+		"duplicate":      valid + "  - {name: example-cert, file: {certificate_chain: /other/fullchain.pem, private_key: /other/key.pem}}\n",
+		"unknown field":  strings.Replace(valid, "private_key: /certs/key.pem", "private_key: /certs/key.pem\n      extra: 1", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse([]byte(yaml)); err == nil {
+				t.Fatal("expected invalid configuration")
+			}
+		})
+	}
+	changed, err := Parse([]byte(strings.Replace(valid, "/certs/fullchain.pem", "/certs/other.pem", 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(RestartRequired(parsed, changed)) != 0 {
+		t.Fatal("file path change must hot reload")
+	}
+}

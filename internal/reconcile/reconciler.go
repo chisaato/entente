@@ -51,7 +51,8 @@ func New(cfg *config.Config, snapshots cache.SnapshotCache, routeNames *xds.Rout
 // SetConfig 替换配置。需要重启才能生效的字段必须已由调用方检查过。
 func (r *Reconciler) SetConfig(cfg *config.Config) {
 	r.mu.Lock()
-	if !slices.Equal(r.cfg.Secrets, cfg.Secrets) {
+	// Secret.File 是指针,按内容比较,避免一次无变化的重载把已同步的文件证书打回未尝试。
+	if !config.SecretsEqual(r.cfg.Secrets, cfg.Secrets) {
 		r.secretsSynced = false
 	}
 	r.cfg = cfg

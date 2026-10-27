@@ -1,5 +1,5 @@
 ---
-Status: accepted
+Status: superseded by ADR-0020
 ---
 
 # Listener 写在 Envoy bootstrap，不使用 LDS

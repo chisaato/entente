@@ -8,6 +8,7 @@
 package model
 
 import (
+	"github.com/chisaato/entente/internal/config"
 	"net/netip"
 	"time"
 )
@@ -48,6 +49,7 @@ type Backend struct {
 
 // Model 是一次 reconcile 的校验结果:其中的内容都可以安全地翻译成 xDS 资源。
 type Model struct {
+	Listeners   []config.Listener
 	Entrypoints []string
 	Routes      []Route
 	Backends    []Backend

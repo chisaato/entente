@@ -8,7 +8,7 @@ Envoy control plane: Docker labels + static YAML → CDS/EDS/RDS over a Unix soc
 - Explicit configuration, no implicit defaults. No default entrypoint; a route that is unclear is
   rejected, not guessed. (ADR-0002)
 - Fail closed, per route: a bad route is dropped and logged; other routes are unaffected. (ADR-0011)
-- No LDS. Listeners live in the Envoy bootstrap; entrypoint = RDS `route_config_name`. (ADR-0004, ADR-0003)
+- Restricted LDS: only YAML-declared TLS listeners are managed dynamically; other listeners stay in bootstrap. Entrypoint = RDS `route_config_name`. Labels never configure TLS bindings. (ADR-0020, ADR-0003)
 - Security decisions never come from labels. `PolicyRef` is reserved and must be rejected while the
   policy layer does not exist. (ADR-0006)
 - All label parsing goes through `internal/labels.Parse`. Never hard-code the label prefix elsewhere. (ADR-0007)

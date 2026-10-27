@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/chisaato/entente/internal/config"
 	"github.com/chisaato/entente/internal/secrets"
@@ -32,7 +33,8 @@ func TestSecretsFirstAttemptBarrier(t *testing.T) {
 	if len(snap.GetResources(resource.SecretType)) != 0 || len(snap.GetResources(resource.RouteType)) != 1 {
 		t.Fatal("first failure must publish routes without secrets")
 	}
-	r.SetSecrets([]secrets.Certificate{{Name: "cert", Certificate: []byte("chain"), PrivateKey: []byte("key")}}, true)
+	now := time.Now()
+	r.SetSecrets([]secrets.Certificate{candidateCertificate(t, []string{"example.com"}, now.Add(-time.Hour), now.Add(24*time.Hour))}, true)
 	r.reconcileOnce(ctx)
 	snap, _ = snapshots.GetSnapshot("envoy")
 	if len(snap.GetResources(resource.SecretType)) != 1 {

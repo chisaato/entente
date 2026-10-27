@@ -19,6 +19,7 @@ import (
 	"github.com/chisaato/entente/internal/config"
 	"github.com/chisaato/entente/internal/secrets"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
@@ -37,7 +38,15 @@ func TestServeOverUDS(t *testing.T) {
 	sock := filepath.Join(t.TempDir(), "xds.sock")
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	snapshots := cache.NewSnapshotCache(false, cache.IDHash{}, nil)
-	res := Translate(testModel(), nil, []secrets.Certificate{{Name: "example-cert", Certificate: []byte("chain"), PrivateKey: []byte("key")}})
+	m := testModel()
+	enabled := true
+	m.Listeners = []config.Listener{{
+		Name: "tls", Address: "127.0.0.1:18443", Entrypoint: "https",
+		HCM: config.HCM{Websocket: &enabled, StripAnyHostPort: &enabled}, ALPN: []string{"http/1.1"},
+		Fallback:    config.Fallback{StaticSecret: "sink"},
+		TLSBindings: []config.TLSBinding{{Name: "example", ServerNames: []string{"whoami.example.com"}, Secret: "example-cert"}},
+	}}
+	res := Translate(m, nil, []secrets.Certificate{{Name: "example-cert", Certificate: []byte("chain"), PrivateKey: []byte("key")}})
 	v, _ := res.Version()
 	snap, err := res.Snapshot(v)
 	if err != nil {
@@ -49,6 +58,8 @@ func TestServeOverUDS(t *testing.T) {
 
 	routeNames := NewRouteNames(nil)
 	srv := NewServer(ctx, snapshots, routeNames, "envoy", sock, 0o660, log)
+	listenerACK := make(chan string, 1)
+	srv.SetListenerAcknowledged(func(version string) { listenerACK <- version })
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve() }()
 	defer srv.Stop()
@@ -117,6 +128,36 @@ func TestServeOverUDS(t *testing.T) {
 	}
 	if secret.GetName() != "example-cert" || string(secret.GetTlsCertificate().GetCertificateChain().GetInlineBytes()) != "chain" || string(secret.GetTlsCertificate().GetPrivateKey().GetInlineBytes()) != "key" {
 		t.Fatal("invalid SDS certificate")
+	}
+
+	// LDS 也走同一条 ADS 流,确认只把成功匹配的响应版本传给发布方。
+	if err := stream.Send(&discovery.DiscoveryRequest{TypeUrl: resource.ListenerType}); err != nil {
+		t.Fatal(err)
+	}
+	lds, err := stream.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lds.GetTypeUrl() != resource.ListenerType || lds.GetVersionInfo() != v || len(lds.GetResources()) != 1 {
+		t.Fatal("invalid LDS response")
+	}
+	var received listener.Listener
+	if err := lds.GetResources()[0].UnmarshalTo(&received); err != nil {
+		t.Fatal(err)
+	}
+	if received.GetName() != "tls" || len(received.GetFilterChains()) != 1 || received.GetDefaultFilterChain() == nil {
+		t.Fatal("missing TLS binding or sink chain")
+	}
+	if err := stream.Send(&discovery.DiscoveryRequest{TypeUrl: resource.ListenerType, VersionInfo: v, ResponseNonce: lds.GetNonce()}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case version := <-listenerACK:
+		if version != v {
+			t.Fatalf("LDS acknowledged %q, want %q", version, v)
+		}
+	case <-ctx.Done():
+		t.Fatal("LDS acknowledgment callback did not run")
 	}
 
 	srv.Stop()

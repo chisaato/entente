@@ -45,9 +45,10 @@ type Config struct {
 	// Docker 启用 Docker 来源。缺省表示关闭。
 	Docker *Docker `yaml:"docker"`
 
-	Static  Static   `yaml:"static"`
-	OpenBao *OpenBao `yaml:"openbao"`
-	Secrets []Secret `yaml:"secrets"`
+	Static    Static     `yaml:"static"`
+	OpenBao   *OpenBao   `yaml:"openbao"`
+	Secrets   []Secret   `yaml:"secrets"`
+	Listeners []Listener `yaml:"listeners"`
 }
 
 type OpenBao struct {
@@ -134,9 +135,17 @@ type StaticBackend struct {
 	Name string `yaml:"name"`
 	// Endpoints 是 "IP:port" 字面量。不接受主机名,因为 backend 经 EDS 下发,
 	// EDS 携带的是地址而不是名字。
-	Endpoints []string `yaml:"endpoints"`
+	Endpoints []string       `yaml:"endpoints"`
+	Docker    *DockerBackend `yaml:"docker"`
 
 	parsed []netip.AddrPort
+}
+
+// DockerBackend 显式引用运行中容器的一张网络,不读取容器的路由 label。
+type DockerBackend struct {
+	Container string `yaml:"container"`
+	Network   string `yaml:"network"`
+	Port      int    `yaml:"port"`
 }
 
 // ParsedEndpoints 返回 Load 校验过的 endpoints。
@@ -310,8 +319,25 @@ func (c *Config) validate() error {
 			add("static backend %q declared twice", b.Name)
 		}
 		seen[b.Name] = true
-		if len(b.Endpoints) == 0 {
+		if b.Docker != nil && b.Endpoints != nil {
+			add("static backend %q: exactly one of endpoints or docker is allowed", b.Name)
+		}
+		if b.Docker == nil && len(b.Endpoints) == 0 {
 			add("static backend %q: endpoints must not be empty", b.Name)
+		}
+		if b.Docker != nil {
+			if c.Docker == nil {
+				add("static backend %q: docker source must be enabled", b.Name)
+			}
+			if strings.TrimSpace(b.Docker.Container) == "" {
+				add("static backend %q: docker.container is required", b.Name)
+			}
+			if strings.TrimSpace(b.Docker.Network) == "" {
+				add("static backend %q: docker.network is required", b.Name)
+			}
+			if b.Docker.Port < 1 || b.Docker.Port > 65535 {
+				add("static backend %q: docker.port must be between 1 and 65535", b.Name)
+			}
 		}
 		b.parsed = b.parsed[:0]
 		for _, e := range b.Endpoints {
@@ -343,6 +369,7 @@ func (c *Config) validate() error {
 		seen[r.Name] = true
 	}
 
+	errs = append(errs, c.validateListeners()...)
 	return errors.Join(errs...)
 }
 

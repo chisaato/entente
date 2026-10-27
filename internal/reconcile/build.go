@@ -20,6 +20,8 @@ type Rejection struct {
 	// Subject 是路由名;如果根本无法从容器构建出路由,则为 "container/<name>"。
 	Subject string
 	Reason  string
+	// Runtime 表示后端的暂时不可用,不能因此拒绝 YAML 候选。
+	Runtime bool
 }
 
 func (r Rejection) String() string { return r.Subject + ": " + r.Reason }
@@ -39,10 +41,29 @@ func Build(cfg *config.Config, containers []docker.Container) (*model.Model, []R
 		rejected = append(rejected, Rejection{Subject: subject, Reason: fmt.Sprintf(format, a...)})
 	}
 
+	// watcher 快照只包含 running 容器,静态引用也复用这份完整快照。
+	byName := map[string]docker.Container{}
+	for _, c := range containers {
+		byName[c.Name] = c
+	}
+	unavailable := map[string]string{}
 	// 静态来源。
 	for _, b := range cfg.Static.Backends {
 		name := "static/" + b.Name
 		backends[name] = model.Backend{Name: name, Source: model.SourceStatic, Endpoints: b.ParsedEndpoints()}
+		if b.Docker != nil {
+			c, found := byName[b.Docker.Container]
+			if !found {
+				unavailable[name] = fmt.Sprintf("backend %q: container %q is not running", name, b.Docker.Container)
+				continue
+			}
+			addr, err := pickAddress(c, b.Docker.Network)
+			if err != nil {
+				unavailable[name] = fmt.Sprintf("backend %q: container %q: %v", name, c.Name, err)
+				continue
+			}
+			backends[name] = model.Backend{Name: name, Source: model.SourceStatic, Endpoints: []netip.AddrPort{netip.AddrPortFrom(addr, uint16(b.Docker.Port))}}
+		}
 	}
 	for _, r := range cfg.Static.Routes {
 		routes = append(routes, model.Route{
@@ -124,12 +145,16 @@ func Build(cfg *config.Config, containers []docker.Container) (*model.Model, []R
 		}
 	}
 
-	m := &model.Model{Entrypoints: slices.Clone(cfg.Entrypoints)}
+	m := &model.Model{Entrypoints: slices.Clone(cfg.Entrypoints), Listeners: slices.Clone(cfg.Listeners)}
 	used := map[string]bool{}
 	for _, r := range valid {
 		if reasons, ok := conflicted[r.Name]; ok {
 			slices.Sort(reasons)
 			reject(r.Name, "%s", strings.Join(reasons, "; "))
+			continue
+		}
+		if problem := unavailable[r.Backend]; problem != "" {
+			rejected = append(rejected, Rejection{Subject: r.Name, Reason: problem, Runtime: true})
 			continue
 		}
 		m.Routes = append(m.Routes, r)

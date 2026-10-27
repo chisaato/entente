@@ -2,14 +2,16 @@
 Status: accepted
 ---
 
-# SNI 分流与兜底链在 bootstrap 里做，兜底不走 SDS
+# SNI 分流与兜底链由 listener 所有者声明
 
-目标是防 SNI 探测（扫描器拿不到真证书及其 SAN），以及在控制平面或 OpenBao 不可用时让 443 仍能完成握手并返回明确错误，而不是连不上。因为 listener 是静态的（ADR-0004），这件事全部在 Envoy bootstrap 里做，Entente 不参与：
+目标仍是防 SNI 探测:未知 SNI 和无 SNI 不获得业务证书。ADR-0020 取代 ADR-0004 后,YAML 声明的 TLS listener 经 LDS 管理,其余静态 listener 仍由 bootstrap 管理:
 
 - 真证书：每条 filter chain 用 `filter_chain_match.server_names` 匹配域名，证书走 SDS（ADR-0014）。
-- 兜底：`default_filter_chain` 接住 SNI 不匹配和不带 SNI 的连接。证书是 bootstrap 里的静态 secret，HCM 用内联 `route_config`，对所有请求 `direct_response` 返回 421 Misdirected Request。兜底链不依赖 Entente，也不依赖 OpenBao。
+- 兜底:`default_filter_chain` 接住 SNI 不匹配和不带 SNI 的连接,HCM 用内联 `route_config`,对所有请求返回 421。YAML 必须二选一显式引用 bootstrap 静态 secret 或 Entente 管理的 secret;静态 secret 的内容无法由 Entente 校验。
 
-兜底证书不走 SDS。真证书缺失时不会退到兜底证书：那条 filter chain 自己握手失败（fail closed），不掩盖故障。`entente gen-cert` 用来生成兜底用的自签证书；它的默认值是 ADR-0002 记下的例外。
+冷启动时,首次材料获取失败的绑定不生成 filter chain,其 SNI 因而落入 421 兜底,并记录 ERROR;材料恢复后补上绑定。热重载缺失材料则拒绝整个候选。LDS listener 绝不引用快照里不存在的动态 secret。`entente gen-cert` 仍用于生成兜底自签证书。
+
+LDS 管理的端口在控制平面尚未成功发布 listener 时不监听,即使兜底引用 bootstrap 静态 secret 也不例外。下面的历史实测记录只描述旧版静态 listener,不能据此推断 LDS 的冷启动行为。
 
 ## Consequences
 

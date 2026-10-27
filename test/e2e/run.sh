@@ -143,4 +143,7 @@ expect_sink_certificate -noservername
 expect 421 https probe.invalid 8443
 expect 200 https legacy.example.com 8443
 
+# 独立栈验证 LDS 绑定新增、事务拒绝和同一 TLS 长连接保留。
+"$root/test/e2e/lds-reload.sh"
+
 echo "e2e passed"

@@ -52,9 +52,10 @@ func main() {
 
 func newRootCommand() *cobra.Command {
 	var (
-		configPath string
-		logLevel   string
-		checkOnly  bool
+		configPath  string
+		logLevel    string
+		checkOnly   bool
+		checkOnline bool
 	)
 
 	cmd := &cobra.Command{
@@ -64,6 +65,7 @@ func newRootCommand() *cobra.Command {
 		Long:    "Entente is an Envoy control plane that turns Docker container labels and static YAML into CDS/EDS/RDS over a Unix domain socket.",
 		// 不注册 completion 子命令,避免多出一个原先没有的入口。
 		CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
+		Args:              cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// 业务错误由下面按原语义打印;解析失败仍走 cobra 默认的错误和用法(退出码 2)。
 			cmd.SilenceUsage = true
@@ -81,6 +83,10 @@ func newRootCommand() *cobra.Command {
 				_ = cmd.Usage()
 				return exitError{code: 2}
 			}
+			if checkOnline && !checkOnly {
+				fmt.Fprintln(cmd.ErrOrStderr(), "--check-online requires --check")
+				return exitError{code: 2}
+			}
 
 			cfg, err := config.Load(configPath)
 			if err != nil {
@@ -88,7 +94,10 @@ func newRootCommand() *cobra.Command {
 				return exitError{code: 1}
 			}
 			if checkOnly {
-				fmt.Println("config OK")
+				if err := checkConfig(cmd.Context(), cfg, checkOnline, cmd.OutOrStdout(), log); err != nil {
+					fmt.Fprintln(cmd.ErrOrStderr(), err)
+					return exitError{code: 1}
+				}
 				return nil
 			}
 
@@ -103,6 +112,7 @@ func newRootCommand() *cobra.Command {
 	cmd.Flags().StringVarP(&configPath, "config", "c", "", "path to the YAML config file (required)")
 	cmd.Flags().StringVarP(&logLevel, "log-level", "l", "info", "debug, info, warn or error")
 	cmd.Flags().BoolVar(&checkOnly, "check", false, "validate the config file and exit")
+	cmd.Flags().BoolVar(&checkOnline, "check-online", false, "with --check, fetch KV certificates and one Docker snapshot")
 	// 与标准库 flag 一样:遇到第一个非选项就停止,不再把后面的参数当 flag。
 	cmd.Flags().SetInterspersed(false)
 	cmd.AddCommand(newGenCertCommand())
@@ -133,6 +143,10 @@ func run(cfg *config.Config, configPath string, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("openbao: %w", err)
 	}
+	rec.SetSecretManager(secretManager)
+	srv := xds.NewServer(ctx, snapshots, routeNames, cfg.NodeID, cfg.XDS.Socket, cfg.SocketFileMode(), log.With("component", "xds"))
+	rec.SetPublisher(srv.Publish)
+	srv.SetListenerAcknowledged(rec.ListenerAcknowledged)
 	goRun(func() { secretManager.Run(ctx) })
 
 	if cfg.Docker != nil {
@@ -146,24 +160,15 @@ func run(cfg *config.Config, configPath string, log *slog.Logger) error {
 
 	goRun(func() { rec.Run(ctx) })
 
-	current := cfg
 	goRun(func() {
 		err := config.Watch(ctx, configPath, log.With("component", "config"), func(next *config.Config) {
-			if fields := config.RestartRequired(current, next); len(fields) > 0 {
-				log.Error("config reload rejected: these fields need a restart", "fields", fields)
-				return
-			}
-			current = next
-			log.Info("config reloaded")
 			rec.SetConfig(next)
-			secretManager.SetSecrets(next.Secrets)
 		})
 		if err != nil {
 			log.Error("config watcher stopped; hot reload disabled", "err", err)
 		}
 	})
 
-	srv := xds.NewServer(ctx, snapshots, routeNames, cfg.NodeID, cfg.XDS.Socket, cfg.SocketFileMode(), log.With("component", "xds"))
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve() }()
 
@@ -171,6 +176,8 @@ func run(cfg *config.Config, configPath string, log *slog.Logger) error {
 	case <-ctx.Done():
 		log.Info("shutting down")
 	case err = <-serveErr:
+		stop()
+	case err = <-rec.Errors():
 		stop()
 	}
 	srv.Stop()

@@ -47,6 +47,7 @@ type Manager struct {
 	states   map[string]*state
 	ctx      context.Context
 	wg       sync.WaitGroup
+	validate func(Certificate) error
 }
 
 // New 创建读取器。cfg 为 nil 时只服务本地文件来源,不建立 HTTP 客户端。
@@ -90,6 +91,10 @@ func New(cfg *config.OpenBao, definitions []config.Secret, log *slog.Logger, onC
 
 // SetSecrets 保留未变化的任务,删除立即生效,新增或修改的任务立即读取。
 func (m *Manager) SetSecrets(definitions []config.Secret) {
+	m.setSecrets(definitions, nil)
+}
+
+func (m *Manager) setSecrets(definitions []config.Secret, certificates []Certificate) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	next := make(map[string]*state, len(definitions))
@@ -107,6 +112,14 @@ func (m *Manager) SetSecrets(definitions []config.Secret) {
 			s = &state{definition: d, certificate: previous}
 			if m.ctx != nil {
 				m.start(s)
+			}
+		}
+		for _, c := range certificates {
+			if c.Name == d.Name {
+				copied := c
+				s.certificate = &copied
+				s.attempted = true
+				break
 			}
 		}
 		next[d.Name] = s
@@ -255,6 +268,9 @@ func (m *Manager) store(s *state, c Certificate, err error, action string) bool 
 	if m.states[s.definition.Name] != s {
 		return false
 	}
+	if err == nil && m.validate != nil {
+		err = m.validate(c)
+	}
 	changed := !s.attempted
 	s.attempted = true
 	if err != nil {
@@ -290,6 +306,9 @@ func parsePair(log *slog.Logger, name string, certPEM, keyPEM []byte) (Certifica
 	leaf, err := x509.ParseCertificate(pair.Certificate[0])
 	if err != nil {
 		return empty, fmt.Errorf("invalid leaf certificate")
+	}
+	if now := time.Now(); now.Before(leaf.NotBefore) || !now.Before(leaf.NotAfter) {
+		return empty, fmt.Errorf("certificate is expired or not yet valid")
 	}
 	if time.Until(leaf.NotAfter) <= 7*24*time.Hour {
 		log.Warn("TLS certificate expired or expires within seven days", "secret", name, "not_after", leaf.NotAfter)

@@ -43,6 +43,7 @@ type Resources struct {
 	Endpoints []types.Resource
 	Routes    []types.Resource
 	Secrets   []types.Resource
+	Listeners []types.Resource
 }
 
 // Translate 从 m 构建 CDS、EDS 和 RDS 资源。模型必须已经过校验且已排序
@@ -121,6 +122,7 @@ func Translate(m *model.Model, placeholders []string, certificates []secrets.Cer
 		}
 	}
 
+	res.Listeners = translateListeners(m.Listeners, sorted)
 	return res
 }
 
@@ -129,7 +131,7 @@ func Translate(m *model.Model, placeholders []string, certificates []secrets.Cer
 func (r Resources) Version() (string, error) {
 	h := sha256.New()
 	opts := proto.MarshalOptions{Deterministic: true}
-	for _, group := range [][]types.Resource{r.Clusters, r.Endpoints, r.Routes, r.Secrets} {
+	for _, group := range [][]types.Resource{r.Clusters, r.Endpoints, r.Routes, r.Secrets, r.Listeners} {
 		for _, res := range group {
 			b, err := opts.Marshal(res)
 			if err != nil {
@@ -152,6 +154,7 @@ func (r Resources) Snapshot(version string) (*cache.Snapshot, error) {
 		resource.EndpointType: r.Endpoints,
 		resource.RouteType:    r.Routes,
 		resource.SecretType:   r.Secrets,
+		resource.ListenerType: r.Listeners,
 	})
 	if err != nil {
 		return nil, err
@@ -165,6 +168,9 @@ func (r Resources) Snapshot(version string) (*cache.Snapshot, error) {
 // consistent 检查快照内部的交叉引用。上游的 Snapshot.Consistent 在这里不能用:
 // 它要求每份 RouteConfiguration 都被某个 LDS listener 引用,但我们的 listener 是静态的。
 func (r Resources) consistent() error {
+	if err := r.validateListeners(); err != nil {
+		return err
+	}
 	clusters := map[string]bool{}
 	for _, res := range r.Clusters {
 		c := res.(*cluster.Cluster)

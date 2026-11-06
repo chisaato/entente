@@ -12,6 +12,9 @@ import (
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	gzip "github.com/envoyproxy/go-control-plane/envoy/extensions/compression/gzip/compressor/v3"
+	zstd "github.com/envoyproxy/go-control-plane/envoy/extensions/compression/zstd/compressor/v3"
+	compressor "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/compressor/v3"
 	router "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	inspector "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/tls_inspector/v3"
 	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
@@ -51,12 +54,13 @@ func translateListeners(definitions []config.Listener, certificates []secrets.Ce
 		bindings := slices.Clone(d.TLSBindings)
 		slices.SortFunc(bindings, func(a, b config.TLSBinding) int { return strings.Compare(a.Name, b.Name) })
 		for _, b := range bindings {
-			if !available[b.Secret] {
+			// Prepare 会报告非法压缩配置;这里也不发布无效绑定,避免无效模型触发 panic。
+			if !available[b.Secret] || b.Compression.Validate() != nil {
 				continue
 			}
 			names := slices.Clone(b.ServerNames)
 			slices.Sort(names)
-			chain := listenerChain(d, b.Name, b.Secret, false, false)
+			chain := listenerChain(d, b.Name, b.Secret, false, false, b.Compression)
 			chain.FilterChainMatch = &listener.FilterChainMatch{ServerNames: names}
 			l.FilterChains = append(l.FilterChains, chain)
 		}
@@ -66,19 +70,22 @@ func translateListeners(definitions []config.Listener, certificates []secrets.Ce
 			name = d.Fallback.StaticSecret
 			static = true
 		}
-		l.DefaultFilterChain = listenerChain(d, d.Name+"/sink", name, static, true)
+		l.DefaultFilterChain = listenerChain(d, d.Name+"/sink", name, static, true, nil)
 		out = append(out, l)
 	}
 	return out
 }
 
-func listenerChain(d config.Listener, name, secret string, static, sink bool) *listener.FilterChain {
+func listenerChain(d config.Listener, name, secret string, static, sink bool, compression *config.Compression) *listener.FilterChain {
 	sds := &tls.SdsSecretConfig{Name: secret}
 	if !static {
 		sds.SdsConfig = adsSource()
 	}
 	ctx := &tls.DownstreamTlsContext{CommonTlsContext: &tls.CommonTlsContext{AlpnProtocols: slices.Clone(d.ALPN), TlsCertificateSdsSecretConfigs: []*tls.SdsSecretConfig{sds}}}
 	h := &hcm.HttpConnectionManager{StatPrefix: d.Name, HttpFilters: []*hcm.HttpFilter{{Name: "envoy.filters.http.router", ConfigType: &hcm.HttpFilter_TypedConfig{TypedConfig: packed(&router.Router{})}}}}
+	if !sink && compression != nil {
+		h.HttpFilters = append(compressionFilters(compression), h.HttpFilters...)
+	}
 	if d.HCM.StripAnyHostPort != nil {
 		h.StripPortMode = &hcm.HttpConnectionManager_StripAnyHostPort{StripAnyHostPort: *d.HCM.StripAnyHostPort}
 	}
@@ -91,6 +98,33 @@ func listenerChain(d config.Listener, name, secret string, static, sink bool) *l
 		h.RouteSpecifier = &hcm.HttpConnectionManager_Rds{Rds: &hcm.Rds{ConfigSource: adsSource(), RouteConfigName: d.Entrypoint}}
 	}
 	return &listener.FilterChain{Name: name, TransportSocket: &core.TransportSocket{Name: "envoy.transport_sockets.tls", ConfigType: &core.TransportSocket_TypedConfig{TypedConfig: packed(ctx)}}, Filters: []*listener.Filter{{Name: "envoy.filters.network.http_connection_manager", ConfigType: &listener.Filter_TypedConfig{TypedConfig: packed(h)}}}}
+}
+
+func compressionFilters(c *config.Compression) []*hcm.HttpFilter {
+	var filters []*hcm.HttpFilter
+	for i, encoding := range c.Encodings {
+		var library proto.Message
+		switch encoding {
+		case "gzip":
+			library = &gzip.Gzip{}
+		case "zstd":
+			library = &zstd.Zstd{}
+		default:
+			panic("unvalidated compression encoding: " + encoding)
+		}
+		p := &compressor.Compressor{
+			ChooseFirst:       i == 0,
+			CompressorLibrary: &core.TypedExtensionConfig{Name: encoding, TypedConfig: packed(library)},
+			ResponseDirectionConfig: &compressor.Compressor_ResponseDirectionConfig{
+				CommonConfig: &compressor.Compressor_CommonDirectionConfig{
+					MinContentLength: wrapperspb.UInt32(*c.MinLength),
+					ContentType:      slices.Clone(c.ContentTypes),
+				},
+			},
+		}
+		filters = append(filters, &hcm.HttpFilter{Name: "envoy.filters.http.compressor", ConfigType: &hcm.HttpFilter_TypedConfig{TypedConfig: packed(p)}})
+	}
+	return filters
 }
 
 func (r Resources) validateListeners() error {

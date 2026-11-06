@@ -63,6 +63,9 @@ func Prepare(cfg *config.Config, containers []docker.Container, materials map[st
 			p.Report.Errors = append(p.Report.Errors, fmt.Errorf("listener %q: unknown fallback secret %q", l.Name, l.Fallback.Secret))
 		}
 		for _, b := range l.TLSBindings {
+			if err := b.Compression.Validate(); err != nil {
+				p.Report.Errors = append(p.Report.Errors, fmt.Errorf("listener %q binding %q: %w", l.Name, b.Name, err))
+			}
 			if !declaredSecrets[b.Secret] {
 				p.Report.Errors = append(p.Report.Errors, fmt.Errorf("listener %q binding %q: unknown secret %q", l.Name, b.Name, b.Secret))
 			}

@@ -11,11 +11,11 @@ Envoy 的外挂控制平面。它把 Docker 容器 label 和 YAML 静态配置�
 _Avoid_: Listener、端口、默认入口
 
 **路由（Route）**:
-把一个 host 挂到一个或多个入口、并指向一个后端的声明。来源是容器 label，或 YAML 里的静态声明。
+把一个 host 挂到一个或多个入口、并指向一个后端的声明。静态路由还可按路径匹配、内部改写路径，并以显式优先级确定同一 host 内的匹配顺序。来源是容器 label，或 YAML 里的静态声明。
 _Avoid_: virtual host（那是下发给 Envoy 的表示）、规则、ingress
 
 **后端（Backend）**:
-路由指向的上游。来源是一个 Docker 容器，或 YAML 里写明的静态地址。
+路由指向的上游，包含访问它所需的传输约定。来源是一个 Docker 容器，或 YAML 里写明的静态地址。
 _Avoid_: Service、upstream、Cluster（Cluster 是下发给 Envoy 的表示）
 
 **策略（Policy）**:
@@ -55,7 +55,7 @@ _Avoid_: 证书文件（下发前不落盘）、把 OpenBao 路径当作 Envoy �
 _Avoid_: 默认证书、fallback 证书（指真证书缺失时自动换上）
 
 **TLS 绑定**:
-一个 listener 上「一组 server name → 一个证书 secret」的对应关系。安全相关，只由运维在 YAML 里声明。
+一个 listener 上「一组 server name → 一个证书 secret」的对应关系，也可限定这组站点的响应压缩行为。只由运维在 YAML 里声明，不负责选择业务后端。
 _Avoid_: 用 label 声明证书或 SNI、把绑定当成路由
 
 **候选**:

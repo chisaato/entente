@@ -15,10 +15,12 @@ import (
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	httpproto "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	"github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/chisaato/entente/internal/model"
@@ -67,7 +69,7 @@ func Translate(m *model.Model, placeholders []string, certificates []secrets.Cer
 	}
 
 	for _, b := range m.Backends {
-		res.Clusters = append(res.Clusters, &cluster.Cluster{
+		c := &cluster.Cluster{
 			Name:                 b.Name,
 			ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS},
 			EdsClusterConfig: &cluster.Cluster_EdsClusterConfig{
@@ -76,7 +78,19 @@ func Translate(m *model.Model, placeholders []string, certificates []secrets.Cer
 			},
 			ConnectTimeout: durationpb.New(upstreamConnectTimeout),
 			LbPolicy:       cluster.Cluster_ROUND_ROBIN,
-		})
+		}
+		if b.H2C {
+			c.TypedExtensionProtocolOptions = map[string]*anypb.Any{
+				"envoy.extensions.upstreams.http.v3.HttpProtocolOptions": packed(&httpproto.HttpProtocolOptions{
+					UpstreamProtocolOptions: &httpproto.HttpProtocolOptions_ExplicitHttpConfig_{
+						ExplicitHttpConfig: &httpproto.HttpProtocolOptions_ExplicitHttpConfig{
+							ProtocolConfig: &httpproto.HttpProtocolOptions_ExplicitHttpConfig_Http2ProtocolOptions{Http2ProtocolOptions: &core.Http2ProtocolOptions{}},
+						},
+					},
+				}),
+			}
+		}
+		res.Clusters = append(res.Clusters, c)
 
 		lbs := make([]*endpoint.LbEndpoint, 0, len(b.Endpoints))
 		for _, ep := range b.Endpoints {
@@ -98,22 +112,51 @@ func Translate(m *model.Model, placeholders []string, certificates []secrets.Cer
 
 	for _, ep := range m.Entrypoints {
 		rc := &route.RouteConfiguration{Name: ep}
+		groups := map[string][]model.Route{}
 		for _, r := range m.Routes {
 			if !slices.Contains(r.Entrypoints, ep) {
 				continue
 			}
-			rc.VirtualHosts = append(rc.VirtualHosts, &route.VirtualHost{
-				Name:    r.Name,
-				Domains: []string{r.Host},
-				Routes: []*route.Route{{
-					Match: &route.RouteMatch{PathSpecifier: &route.RouteMatch_Prefix{Prefix: "/"}},
+			groups[r.Host] = append(groups[r.Host], r)
+		}
+		for host, group := range groups {
+			slices.SortFunc(group, func(a, b model.Route) int {
+				if a.Priority != nil && b.Priority != nil {
+					if *a.Priority < *b.Priority {
+						return -1
+					}
+					if *a.Priority > *b.Priority {
+						return 1
+					}
+				}
+				return strings.Compare(a.Name, b.Name)
+			})
+			name := group[0].Name
+			if len(group) > 1 {
+				name = "host/" + host
+			}
+			vh := &route.VirtualHost{Name: name, Domains: []string{host}}
+			for _, r := range group {
+				path := r.Path
+				if path == "" {
+					path = "/"
+				}
+				match := &route.RouteMatch{PathSpecifier: &route.RouteMatch_Prefix{Prefix: path}}
+				if r.PathType == "exact" {
+					match.PathSpecifier = &route.RouteMatch_Path{Path: path}
+				}
+				vh.Routes = append(vh.Routes, &route.Route{
+					Match: match,
 					Action: &route.Route_Route{Route: &route.RouteAction{
 						ClusterSpecifier: &route.RouteAction_Cluster{Cluster: r.Backend},
 						Timeout:          durationpb.New(r.Timeout),
+						PrefixRewrite:    r.Rewrite,
 					}},
-				}},
-			})
+				})
+			}
+			rc.VirtualHosts = append(rc.VirtualHosts, vh)
 		}
+		slices.SortFunc(rc.VirtualHosts, func(a, b *route.VirtualHost) int { return strings.Compare(a.Name, b.Name) })
 		res.Routes = append(res.Routes, rc)
 	}
 	for _, name := range placeholders {
@@ -196,6 +239,7 @@ func (r Resources) consistent() error {
 		rc := res.(*route.RouteConfiguration)
 		domains := map[string]bool{}
 		for _, vh := range rc.GetVirtualHosts() {
+			matches := map[string]bool{}
 			for _, d := range vh.GetDomains() {
 				if domains[d] {
 					return fmt.Errorf("route config %q: domain %q appears twice", rc.GetName(), d)
@@ -203,6 +247,12 @@ func (r Resources) consistent() error {
 				domains[d] = true
 			}
 			for _, rt := range vh.GetRoutes() {
+				// 即便调用者绕过 Build,重复 match 也不能以输入顺序挑赢家。
+				key := rt.GetMatch().String()
+				if matches[key] {
+					return fmt.Errorf("route config %q: virtual host %q has duplicate match", rc.Name, vh.Name)
+				}
+				matches[key] = true
 				if c := rt.GetRoute().GetCluster(); !clusters[c] {
 					return fmt.Errorf("route config %q: virtual host %q references unknown cluster %q", rc.GetName(), vh.GetName(), c)
 				}

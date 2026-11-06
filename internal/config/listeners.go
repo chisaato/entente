@@ -2,8 +2,10 @@ package config
 
 import (
 	"fmt"
+	"mime"
 	"net/netip"
 	"slices"
+	"strings"
 
 	"github.com/chisaato/entente/internal/labels"
 )
@@ -30,9 +32,42 @@ type Fallback struct {
 }
 
 type TLSBinding struct {
-	Name        string   `yaml:"name"`
-	ServerNames []string `yaml:"server_names"`
-	Secret      string   `yaml:"secret"`
+	Name        string       `yaml:"name"`
+	ServerNames []string     `yaml:"server_names"`
+	Secret      string       `yaml:"secret"`
+	Compression *Compression `yaml:"compression"`
+}
+
+// Compression 只作用于此 TLS binding 的业务 HCM,不影响其他绑定或 sink。
+type Compression struct {
+	Encodings    []string `yaml:"encodings"`
+	MinLength    *uint32  `yaml:"min_length"`
+	ContentTypes []string `yaml:"content_types"`
+}
+
+func (c *Compression) Validate() error {
+	if c == nil {
+		return nil
+	}
+	if len(c.Encodings) == 0 || c.MinLength == nil || len(c.ContentTypes) == 0 {
+		return fmt.Errorf("compression requires encodings, min_length and content_types")
+	}
+	seen := map[string]bool{}
+	for _, e := range c.Encodings {
+		if (e != "zstd" && e != "gzip") || seen[e] {
+			return fmt.Errorf("compression: unknown or duplicate encoding %q", e)
+		}
+		seen[e] = true
+	}
+	seen = map[string]bool{}
+	for _, value := range c.ContentTypes {
+		media, params, err := mime.ParseMediaType(value)
+		if err != nil || !strings.Contains(media, "/") || strings.Contains(value, "*") || len(params) != 0 || media != value || seen[value] {
+			return fmt.Errorf("compression: content type %q must be a unique exact MIME type without parameters or wildcards", value)
+		}
+		seen[value] = true
+	}
+	return nil
 }
 
 func (c *Config) validateListeners() []error {
@@ -78,6 +113,9 @@ func (c *Config) validateListeners() []error {
 		}
 		bindings, hosts := map[string]bool{}, map[string]bool{}
 		for _, b := range l.TLSBindings {
+			if err := b.Compression.Validate(); err != nil {
+				add("listener %q binding %q: %v", l.Name, b.Name, err)
+			}
 			if !nameRe.MatchString(b.Name) || bindings[b.Name] {
 				add("listener %q: invalid or duplicate binding %q", l.Name, b.Name)
 			}

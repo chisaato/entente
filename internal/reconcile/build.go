@@ -29,8 +29,8 @@ func (r Rejection) String() string { return r.Subject + ": " + r.Reason }
 // Build 把配置和当前的 Docker 容器变成 Model。
 //
 // 每项检查都 fail closed,并且只作用于出错的那条路由:被拒绝的路由被排除并上报,
-// 其他路由不受影响。两条及以上路由在同一 entrypoint 上声明同一 host 时,全部拒绝,
-// 因为挑出一个赢家本身就是隐含规则。
+// 其他路由不受影响。同 host 多路由必须显式声明路径与唯一优先级,
+// 冲突组全部拒绝,不能挑出隐含赢家。
 func Build(cfg *config.Config, containers []docker.Container) (*model.Model, []Rejection) {
 	var (
 		routes   []model.Route
@@ -50,7 +50,7 @@ func Build(cfg *config.Config, containers []docker.Container) (*model.Model, []R
 	// 静态来源。
 	for _, b := range cfg.Static.Backends {
 		name := "static/" + b.Name
-		backends[name] = model.Backend{Name: name, Source: model.SourceStatic, Endpoints: b.ParsedEndpoints()}
+		backends[name] = model.Backend{Name: name, Source: model.SourceStatic, H2C: b.H2C, Endpoints: b.ParsedEndpoints()}
 		if b.Docker != nil {
 			c, found := byName[b.Docker.Container]
 			if !found {
@@ -62,7 +62,7 @@ func Build(cfg *config.Config, containers []docker.Container) (*model.Model, []R
 				unavailable[name] = fmt.Sprintf("backend %q: container %q: %v", name, c.Name, err)
 				continue
 			}
-			backends[name] = model.Backend{Name: name, Source: model.SourceStatic, Endpoints: []netip.AddrPort{netip.AddrPortFrom(addr, uint16(b.Docker.Port))}}
+			backends[name] = model.Backend{Name: name, Source: model.SourceStatic, H2C: b.H2C, Endpoints: []netip.AddrPort{netip.AddrPortFrom(addr, uint16(b.Docker.Port))}}
 		}
 	}
 	for _, r := range cfg.Static.Routes {
@@ -72,6 +72,10 @@ func Build(cfg *config.Config, containers []docker.Container) (*model.Model, []R
 			Entrypoints: r.Entrypoints,
 			Host:        r.Host,
 			Backend:     "static/" + r.Backend,
+			Path:        r.Path,
+			PathType:    r.PathType,
+			Rewrite:     r.Rewrite,
+			Priority:    r.Priority,
 			PolicyRef:   r.Policy,
 			Timeout:     routeTimeout(cfg, r.ParsedTimeout()),
 		})
@@ -127,20 +131,41 @@ func Build(cfg *config.Config, containers []docker.Container) (*model.Model, []R
 	}
 
 	// 每个 entrypoint 上的 host 冲突:{entrypoint, host} -> 路由名。
-	claims := map[[2]string][]string{}
+	claims := map[[2]string][]model.Route{}
 	for _, r := range valid {
 		for _, ep := range r.Entrypoints {
 			k := [2]string{ep, r.Host}
-			claims[k] = append(claims[k], r.Name)
+			claims[k] = append(claims[k], r)
 		}
 	}
 	conflicted := map[string][]string{}
-	for k, names := range claims {
-		if len(names) < 2 {
+	for k, group := range claims {
+		if len(group) < 2 {
 			continue
 		}
+		var names []string
+		priorities, matches := map[int]bool{}, map[[2]string]bool{}
+		conflict := false
+		for _, r := range group {
+			names = append(names, r.Name)
+			match := [2]string{r.PathType, r.Path}
+			if r.Source != model.SourceStatic || r.Path == "" || r.Priority == nil || matches[match] {
+				conflict = true
+			}
+			if r.Priority != nil {
+				if priorities[*r.Priority] {
+					conflict = true
+				}
+				priorities[*r.Priority] = true
+			}
+			matches[match] = true
+		}
+		if !conflict {
+			continue
+		}
+		slices.Sort(names)
 		for _, n := range names {
-			conflicted[n] = append(conflicted[n], fmt.Sprintf("host %q on entrypoint %q is also claimed by %s",
+			conflicted[n] = append(conflicted[n], fmt.Sprintf("host %q on entrypoint %q requires explicit paths and unique priorities/matches; is also claimed by %s",
 				k[1], k[0], strings.Join(without(names, n), ", ")))
 		}
 	}
@@ -180,6 +205,9 @@ func routeTimeout(cfg *config.Config, override *time.Duration) time.Duration {
 }
 
 func checkRoute(r model.Route, declared map[string]bool, backends map[string]model.Backend) string {
+	if problem := r.PathError(); problem != "" {
+		return problem
+	}
 	if r.PolicyRef != "" {
 		return fmt.Sprintf("policy %q requested, but the policy layer is not implemented yet", r.PolicyRef)
 	}

@@ -133,6 +133,8 @@ type Static struct {
 
 type StaticBackend struct {
 	Name string `yaml:"name"`
+	// H2C 显式使用无 TLS 的 HTTP/2 prior knowledge;省略保持 HTTP/1.1。
+	H2C bool `yaml:"h2c"`
 	// Endpoints 是 "IP:port" 字面量。不接受主机名,因为 backend 经 EDS 下发,
 	// EDS 携带的是地址而不是名字。
 	Endpoints []string       `yaml:"endpoints"`
@@ -156,6 +158,11 @@ type StaticRoute struct {
 	Entrypoints []string `yaml:"entrypoints"`
 	Host        string   `yaml:"host"`
 	Backend     string   `yaml:"backend"`
+	Path        string   `yaml:"path"`
+	PathType    string   `yaml:"path_type"`
+	Rewrite     string   `yaml:"rewrite"`
+	// Priority 区分省略和显式 0;同 host 多路径时必须声明。
+	Priority *int `yaml:"priority"`
 	// Timeout 可选,覆盖顶层 route_timeout;指针用于区分省略与显式空值。
 	Timeout *string `yaml:"timeout"`
 	timeout *time.Duration

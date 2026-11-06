@@ -1,15 +1,15 @@
 # Entente
 
-Envoy 的外挂控制平面。它读取 Docker 容器 label 和静态 YAML,通过 Unix socket 上的 xDS(CDS / EDS / RDS / SDS)
+Envoy 的外挂控制平面。它读取 Docker 容器 label 和静态 YAML,通过 Unix socket 上的 xDS(CDS / EDS / RDS / SDS / LDS)
 把路由和证书推给 Envoy。证书来自 OpenBao KV,或本地 PEM 文件。效果类似 Traefik 的 Docker provider:给容器贴上 label,路由就自动出现;数据面是 Envoy。
 
 面向不跑 Kubernetes 的单机部署。设计见 [docs/adr/](docs/adr/)，定位见 [ADR-0001](docs/adr/0001-standalone-envoy-control-plane.md)。
 
 ## 分工
 
-- **Envoy bootstrap(运维手写)**:监听端口、TLS、filter chain。Entente 不使用 LDS,也不创建端口。
-- **Entente**:每个声明的入口(即 bootstrap 里的 `rds.route_config_name`)推送一份 RouteConfiguration,
-  每个后端推送一个 EDS cluster,从 OpenBao KV v2 或本地 PEM 文件读取证书并通过 SDS 下发。
+- **Envoy bootstrap(运维手写)**:配置 xDS 连接、admin、兜底证书和不交给 Entente 的静态 listener。
+- **Entente**:每个声明的入口推送一份 RouteConfiguration,每个后端推送一个 EDS cluster,
+  从 OpenBao KV v2 或本地 PEM 文件读取证书并通过 SDS 下发；还可通过受限 LDS 管理 YAML 显式声明的 TLS listener。
 
 没有任何默认入口,也没有隐含默认值:容器不写 `entrypoints` 就不会被暴露,引用了未声明入口的路由会被拒绝。
 
@@ -63,10 +63,41 @@ static:
 未知字段会被拒绝。配置文件变化时自动热重载;新配置无效时继续使用旧配置,并打错误日志。
 `route_timeout` 支持热重载;静态路由的 `timeout` 或容器 label 的 `timeout` 可覆盖它,
 省略覆盖值才继承顶层值,显式 `0s` 表示不限时。非法超时会拒绝整份 YAML 或对应容器路由。
-WebSocket 升级由 Envoy bootstrap HCM 的 `upgrade_configs` 配置,Entente 不管理它。
+静态 listener 的 WebSocket 升级由 bootstrap HCM 的 `upgrade_configs` 配置；托管 TLS listener 用显式 `hcm.websocket` 配置。
 `node_id`、`xds.*`、Docker 来源开关、`docker.host` 和 `openbao.*` 修改后需要重启。
 
 `entente --config <file> --check` 只校验配置,不启动。`--config` 的短选项是 `-c`,`--log-level` 的短选项是 `-l`;`--check` 没有短选项。旧的单横线长名(`-config` 等)不再接受。
+
+### h2c 与同域名路径路由
+
+`h2c: true` 显式启用上游明文 HTTP/2（prior knowledge，不回退 HTTP/1.1）。它与 listener 的 `alpn: [h2, http/1.1]` 不同：前者控制到后端的连接，后者控制客户端到 Envoy 的 TLS 协商。
+
+```yaml
+static:
+  backends:
+    - {name: api, endpoints: ["127.0.0.1:8085"], h2c: true}
+    - {name: login, endpoints: ["127.0.0.1:3006"]}
+  routes:
+    - {name: api-prefix, entrypoints: [https], host: sso.example.com, backend: api, path: /api/, path_type: prefix, rewrite: /, priority: 10, timeout: 0s}
+    - {name: login, entrypoints: [https], host: sso.example.com, backend: login, path: /ui/v2/login, path_type: prefix, priority: 20}
+    - {name: root, entrypoints: [https], host: sso.example.com, backend: login, path: /, path_type: exact, rewrite: /ui/v2/login/, priority: 30}
+    - {name: fallback, entrypoints: [https], host: sso.example.com, backend: api, path: /, path_type: prefix, priority: 40, timeout: 0s}
+```
+
+`path` 与 `path_type` 必须成对；多路径路由显式声明唯一 `priority`，越小越先，不能依赖声明顺序。`rewrite` 是内部前缀替换，不产生 302：上述 `/api/users` 转为 `/users`，精确 `/` 转为 `/ui/v2/login/`；`/api` 不匹配 `/api/`。重复匹配条件或优先级拒绝，旧的无路径单后端配置保持兼容。路径路由仅由 YAML 声明，不支持 label。见 [ADR-0021](docs/adr/0021-explicit-h2c-and-static-path-routes.md)。
+
+### 站点级响应压缩
+
+仅在需要压缩的 `listeners[].tls_bindings[]` 上添加：
+
+```yaml
+compression:
+  encodings: [zstd, gzip]
+  min_length: 512
+  content_types: [text/html, text/plain, text/css, application/javascript, application/json, image/svg+xml]
+```
+
+这些字段都要显式给出；编码顺序决定偏好，MIME 必须精确枚举，不支持 `text/*`。其他绑定与兜底链不受影响。同一证书可被多个绑定复用，以区分压缩站点与非压缩站点。这不保证与 Caddy 的通配 MIME 或所有编码细节完全一致。见 [ADR-0022](docs/adr/0022-tls-binding-response-compression.md)。
 
 ## SDS / OpenBao 证书
 
@@ -142,7 +173,7 @@ labels:
 
 - 已启用的容器上有未知的 `entente.*` label(比如拼错成 `entente.entrypoint`)
 - 设置了 `entente.policy`:策略层尚未实现,静默忽略就等于 fail open
-- 同一入口上已有别的路由声明了相同的 host
+- 同一入口上有多个容器或无路径路由争用相同 host，或容器路由与该 host 的静态路径集合冲突
 
 ## 开发
 

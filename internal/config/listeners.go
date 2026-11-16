@@ -14,6 +14,7 @@ import (
 type Listener struct {
 	Name        string       `yaml:"name"`
 	Address     string       `yaml:"address"`
+	IPv4Compat  *bool        `yaml:"ipv4_compat,omitempty"`
 	Entrypoint  string       `yaml:"entrypoint"`
 	HCM         HCM          `yaml:"hcm"`
 	ALPN        []string     `yaml:"alpn"`
@@ -85,6 +86,8 @@ func (c *Config) validateListeners() []error {
 		names[l.Name] = true
 		if ap, err := netip.ParseAddrPort(l.Address); err != nil || ap.Port() == 0 {
 			add("listener %q: address must be an IP:port literal", l.Name)
+		} else if l.IPv4Compat != nil && *l.IPv4Compat && !ap.Addr().Is6() {
+			add("listener %q: ipv4_compat can only be enabled for IPv6 addresses", l.Name)
 		}
 		if !slices.Contains(c.Entrypoints, l.Entrypoint) {
 			add("listener %q: entrypoint %q is not declared", l.Name, l.Entrypoint)

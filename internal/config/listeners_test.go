@@ -41,11 +41,30 @@ func TestListenerExplicitConfiguration(t *testing.T) {
 		{"duplicate server name", "example.com]", "\"*.example.com\"]"},
 		{"bad wildcard", "*.example.com", "*.*.example.com"},
 		{"missing bindings", "    tls_bindings:\n      - {name: example, server_names: [\"*.example.com\", example.com], secret: cert}", ""},
+		{"ipv4_compat on ipv4", "address: \"[::]:443\"", "address: \"127.0.0.1:443\", ipv4_compat: true"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := Parse([]byte(strings.Replace(listenerYAML, tc.from, tc.to, 1))); err == nil {
 				t.Fatal("invalid listener accepted")
 			}
 		})
+	}
+}
+
+func TestListenerIPv4Compat(t *testing.T) {
+	cfg, err := Parse([]byte(strings.Replace(listenerYAML, "address: \"[::]:443\"", "address: \"[::]:443\"\n    ipv4_compat: true", 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Listeners[0].IPv4Compat == nil || !*cfg.Listeners[0].IPv4Compat {
+		t.Fatalf("expected IPv4Compat to be true, got %v", cfg.Listeners[0].IPv4Compat)
+	}
+
+	cfgDefault, err := Parse([]byte(listenerYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfgDefault.Listeners[0].IPv4Compat != nil {
+		t.Fatalf("expected IPv4Compat to be nil by default, got %v", cfgDefault.Listeners[0].IPv4Compat)
 	}
 }

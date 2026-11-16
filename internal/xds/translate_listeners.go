@@ -50,7 +50,23 @@ func translateListeners(definitions []config.Listener, certificates []secrets.Ce
 		if err != nil {
 			continue
 		}
-		l := &listener.Listener{Name: d.Name, Address: &core.Address{Address: &core.Address_SocketAddress{SocketAddress: &core.SocketAddress{Address: ap.Addr().String(), PortSpecifier: &core.SocketAddress_PortValue{PortValue: uint32(ap.Port())}}}}, ListenerFilters: []*listener.ListenerFilter{{Name: "envoy.filters.listener.tls_inspector", ConfigType: &listener.ListenerFilter_TypedConfig{TypedConfig: packed(&inspector.TlsInspector{})}}}}
+		var ipv4Compat bool
+		if d.IPv4Compat != nil {
+			ipv4Compat = *d.IPv4Compat
+		}
+		l := &listener.Listener{
+			Name: d.Name,
+			Address: &core.Address{
+				Address: &core.Address_SocketAddress{
+					SocketAddress: &core.SocketAddress{
+						Address:       ap.Addr().String(),
+						PortSpecifier: &core.SocketAddress_PortValue{PortValue: uint32(ap.Port())},
+						Ipv4Compat:    ipv4Compat,
+					},
+				},
+			},
+			ListenerFilters: []*listener.ListenerFilter{{Name: "envoy.filters.listener.tls_inspector", ConfigType: &listener.ListenerFilter_TypedConfig{TypedConfig: packed(&inspector.TlsInspector{})}}},
+		}
 		bindings := slices.Clone(d.TLSBindings)
 		slices.SortFunc(bindings, func(a, b config.TLSBinding) int { return strings.Compare(a.Name, b.Name) })
 		for _, b := range bindings {

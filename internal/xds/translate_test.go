@@ -7,8 +7,10 @@ import (
 
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 
+	"github.com/chisaato/entente/internal/config"
 	"github.com/chisaato/entente/internal/model"
 )
 
@@ -120,5 +122,29 @@ func TestTranslatePlaceholders(t *testing.T) {
 	rc := res.Routes[2].(*route.RouteConfiguration)
 	if rc.GetName() != "retired" || len(rc.GetVirtualHosts()) != 0 {
 		t.Errorf("placeholder = %v", rc)
+	}
+}
+
+func TestTranslateListenersIPv4Compat(t *testing.T) {
+	trueVal := true
+	m := testModel()
+	m.Listeners = []config.Listener{
+		{
+			Name:       "https",
+			Address:    "[::]:8443",
+			IPv4Compat: &trueVal,
+			Entrypoint: "https",
+			ALPN:       []string{"h2"},
+			Fallback:   config.Fallback{StaticSecret: "sink"},
+		},
+	}
+	res := Translate(m, nil, nil)
+	if len(res.Listeners) != 1 {
+		t.Fatalf("expected 1 listener, got %d", len(res.Listeners))
+	}
+	l := res.Listeners[0].(*listener.Listener)
+	sa := l.GetAddress().GetSocketAddress()
+	if !sa.GetIpv4Compat() {
+		t.Errorf("expected Ipv4Compat to be true, got false")
 	}
 }
